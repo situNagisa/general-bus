@@ -34,24 +34,25 @@
 // 并绕回来覆盖这一半了：你读到的可能是新旧混合的数据，但 HTIF/TCIF 照样正常，
 // 不会置 OVR/TE，也不会有任何错误标志——这就是“静默覆盖”。
 // 本文件用两个手段暴露它：
-//   1) 一次中断里同时看到 HTIF 和 TCIF，说明至少一整块没来得及处理（g_late）；
+//   1) 一次中断里同时看到 HTIF 和 TCIF，说明 HT 那半块还没处理，
+//      DMA 就已经绕完一圈（g_late）；
 //   2) 用 DWT 周期计数器量每次处理耗时（g_proc_max），和理论半块时间对比。
 // 真要彻底避免，只能减少每块处理量、提高中断优先级、把处理搬到 DMA，或者
 // 用双缓冲/多块环形队列给 link 留出更多余量。
 //
 // ── 硬件/软件条件 ──
 // - STM32F4/F7，CMSIS 头；ADC1 的 4 个通道接 PA0..PA3。
-// - 连续转换 + 扫描模式；DMA2 Stream0 通道 0。
+// - 连续转换 + 扫描模式；DMA2 Stream0 通道 0（映射表未核对）。
 // - F7 开 D-Cache 时，DMA 写入的缓冲区要做 cache invalidate 或放 non-cacheable 区，
 //   否则 CPU 可能一直读到旧数据。F4 无 D-Cache，不需要。
 //
 // ── 编译与运行 ──
-//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb \
-//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld \
+//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb
+//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld
 //       startup_stm32f4xx.s dma_circular_half.cpp -o dma_circular_half.elf
 // 烧录后通过 SWO/ITM 看输出。预期输出：每完成一圈打印前后两半的统计量，
 // 以及处理耗时和“迟到”次数，例如：
-//   half=1/2 sum=... min=... max=... | max_proc=1520 cycles late=0
+//   lap 2: front sum=... min=... max=... | back sum=... min=... max=... | max_proc=1520 cycles late=0
 // late 一旦非 0，说明某次处理超过了一整块的时间，数据已经不可信；
 // max_proc 接近理论半块周期时也已经在危险边缘。
 
@@ -70,6 +71,7 @@ constexpr std::size_t kHalf = 128;                 // 半块采样数
 constexpr std::size_t kRing = 2 * kHalf;           // NDTR 的初值 = 整块
 constexpr std::uint32_t kAdcDmaChannel = 0;        // DMA2 Stream0 CHSEL=0 → ADC1
 constexpr std::uint32_t kAdcSampleTime = 7;        // 480 个 ADC 周期
+constexpr std::size_t kChannels = 4;
 
 using sample_t = std::uint16_t;
 
@@ -124,6 +126,9 @@ void adc_init() noexcept {
 	(void)RCC->AHB1ENR;
 	(void)RCC->APB2ENR;
 
+	// ADC 时钟由 ADC->CCR 的 ADCPRE 分频，F4 上不能超过 36 MHz；
+	// 本示例假设板级初始化已把它设到合规频率（例如 PCLK2/4 = 21 MHz）。
+
 	GPIOA->MODER |= GPIO_MODER_MODER0 | GPIO_MODER_MODER1 |
 		GPIO_MODER_MODER2 | GPIO_MODER_MODER3;
 
@@ -133,15 +138,16 @@ void adc_init() noexcept {
 		(kAdcSampleTime << ADC_SMPR2_SMP1_Pos) |
 		(kAdcSampleTime << ADC_SMPR2_SMP2_Pos) |
 		(kAdcSampleTime << ADC_SMPR2_SMP3_Pos);
-	ADC1->SQR1 = static_cast<std::uint32_t>(4 - 1) << ADC_SQR1_L_Pos;
+	ADC1->SQR1 = static_cast<std::uint32_t>(kChannels - 1) << ADC_SQR1_L_Pos;
 	ADC1->SQR3 = (0U << ADC_SQR3_SQ1_Pos) | (1U << ADC_SQR3_SQ2_Pos) |
 		(2U << ADC_SQR3_SQ3_Pos) | (3U << ADC_SQR3_SQ4_Pos);
 
-	for (volatile std::uint32_t i = 0; i < 1000; ++i) {
+	for (std::uint32_t i = 0; i < 1000; ++i) {
+		__NOP();
 	}
 }
 
-// 循环模式只需要武装一次：NDTR 之后由硬件在每次 TC 时自动重装，
+// 循环模式只需要武装一次：每搬完一整块（NDTR 到 0）由硬件自动重装初值，
 // 内存地址也由硬件绕回，软件不再参与。
 void dma_start() noexcept {
 	DMA2_Stream0->CR &= ~DMA_SxCR_EN;
@@ -198,9 +204,9 @@ void handle_half(std::size_t index) noexcept {
 	}
 
 	if (index == 0) {
-		++g_half_count;
+		g_half_count = g_half_count + 1;
 	} else {
-		++g_full_count;
+		g_full_count = g_full_count + 1;
 	}
 }
 
@@ -215,7 +221,7 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 	// DMA 已经绕回并覆盖了先前那一半。数据不一定完全坏，但已经不可信。
 	// 这是循环模式唯一能“察觉”处理不过来的廉价信号。
 	if (ht && tc) {
-		++g_late;
+		g_late = g_late + 1;
 	}
 
 	if (ht) {
@@ -227,8 +233,8 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 	}
 
 	if (tc) {
-		// TC 时 NDTR 已经被硬件重装，DMA 正在写后半（接着绕回前半），
-		// 这里处理的是刚满的后半。
+		// TC 时 NDTR 已经被硬件重装，DMA 已绕回并开始写前半；
+		// 这里处理的是刚满的后半。后半在下一次绕回前是稳定的。
 		DMA2->LIFCR = DMA_LIFCR_CTCIF0;
 		__DMB();
 		handle_half(1);
@@ -238,16 +244,16 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 	// 注意重启会从缓冲区开头重新开始，之前未处理的数据就没了。
 	if (sr & DMA_LISR_TEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CTEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 		dma_start();
 	}
 	if (sr & DMA_LISR_DMEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CDMEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 	}
 	if (sr & DMA_LISR_FEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CFEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 	}
 }
 

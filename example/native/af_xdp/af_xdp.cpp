@@ -1,66 +1,71 @@
 /*
- * af_xdp.cpp —— AF_XDP socket（Linux 原生 UAPI，不依赖 libbpf / libxdp）
- *
- * 一、它是什么
- * AF_XDP 是 Linux 4.18 起提供的套接字地址族（AF_XDP = 44，SOL_XDP = 283），
- * 把一个网卡的某个接收队列“旁路”给用户态：驱动（或内核的通用 XDP 路径）
- * 直接通过共享内存环把收到的帧递给用户进程，用户进程也通过共享内存环交包给驱动发送。
- * 它由三块组成：
- *   1. UMEM：一块由“用户”分配的连续内存，被切成固定大小的 chunk（frame），
- *      所有收发数据都放在这里面，内核不会替你再分配包缓冲区；
- *   2. 四张单生产者/单消费者环（fill / completion / rx / tx），由内核分配、
- *      用户 mmap 到自己的地址空间，双方通过 read/write 索引交换描述符；
- *   3. XDP 程序 + XSKMAP：只有网卡入口的 XDP 程序对包执行 XDP_REDIRECT 并把它
- *      redirect 到本 socket 的 XSKMAP 表项，包才会进入 rx 环（见下面的说明）。
- *
- * 二、解决什么问题、什么时候用
- * 普通 socket 每个包都要经过 skb 分配、协议栈、系统调用；AF_XDP 把这些都绕开，
- * 用户态批量地看/填共享环即可，单核可以做到每秒千万级包的收发，同时网卡仍由
- * 内核管理（路由、中断、ethtool 都还在），不像 DPDK 那样独占设备。
- * 适合：用户态包处理/转发、负载均衡、DNS 之类的高 PPS 服务、抓包加速。
- * 不适合：吞吐大但包数少的大块传输（这时普通 socket / io_uring 更省事）。
- *
- * 三、它的“形态”（重点，和 read/write 式接口完全不同）
- *   - 数据面没有 read/write/recvfrom/sendto 传数据：数据全部在 UMEM 里，
- *     双方只交换 16 字节的描述符（xdp_desc：addr 是相对 UMEM 起点的偏移、
- *     len 是包长、options 是标志）。一次“提交”是往 tx 环里放 N 个描述符，
- *     对应线上 N 个以太网帧；内核发完后往 completion 环放 N 个 addr 归还缓冲区。
- *   - 一次 sendto() 不携带数据，只是“踢”内核：告诉它“环里有新东西了，来看一眼”。
- *   - 一个 UMEM 的 chunk 可以是 2048/4096 字节；默认一个包占一个 chunk，
- *     巨型帧要开 XDP_USE_SG 才允许多 chunk 拼一个包（本示例不用）。
- *   - 内存归属：UMEM 由用户提供并负责生命周期；四张环的内核部分由内核分配，
- *     用户只 mmap 映射。描述符里的 addr 永远是“UMEM 内的偏移”，不是指针。
- *
- * 四、四张环的生产者/消费者（本例代码严格按这个方向读写）
- *   环名          生产者        消费者        放的东西
- *   fill   (fr)   用户          内核          空闲 frame 的 UMEM 偏移（__u64）
- *   rx            内核          用户          收到的包（struct xdp_desc）
- *   tx            用户          内核          要发的包（struct xdp_desc）
- *   completion(cr)内核          用户          已发完的 frame 偏移（__u64）
- *   用户侧对 fill/tx 只写 producer，对 rx/completion 只写 consumer；另外各自
- *   缓存一份对方的索引（cached_*），只有跨过缓存线时才真正读对方的内存。
- *   环大小是 2 的幂，索引自由回绕，用“无符号减法”算可用槽位。
- *
- * 五、前置条件
- *   - 需要 root 或 CAP_NET_RAW（创建 AF_XDP socket 本身就要）。没有权限时
- *     socket() 返回 EPERM，本程序会如实打印出来。
- *   - 网卡驱动要支持 XDP（至少 copy 模式）。lo 这种没有 ndo_bpf 的设备
- *     bind 可能返回 EOPNOTSUPP，这是设备限制而不是代码问题，注释里已说明。
- *   - 真正“收”到包还要求接口上挂了 XDP 程序并 redirect 到本 socket 的 XSKMAP；
- *     本示例只做到 bind（以及 TX 方向发一个包），重定向部分只给说明，见
- *     setup 末尾的注释块。
- *
- * 六、编译与运行
- *   g++ -std=c++26 -O2 -Wall -Wextra -o /tmp/native_af_xdp af_xdp.cpp
- *   sudo /tmp/native_af_xdp [网卡名]     # 默认 lo
- *   预期输出：逐条打印 socket/UMEM/四个环/bind 的结果；root 下在 TX 环提交
- *   一个 UDP 包（Ethernet + IPv4 + UDP，目标是 127.0.0.1:9999），等 completion
- *   环把它还回来，最后打印 XDP_STATISTICS。非 root 时在第一步打印 EPERM 退出。
- *
- * 七、参考
- *   /usr/include/linux/if_xdp.h（本机的 UAPI 头，字段/常量以此为准）、
- *   内核 Documentation/networking/af_xdp.rst。
- */
+	* af_xdp.cpp —— AF_XDP socket（Linux 原生 UAPI，不依赖 libbpf / libxdp）
+	*
+	* 一、它是什么
+	* AF_XDP 是 Linux 4.18 起提供的套接字地址族（AF_XDP = 44，SOL_XDP = 283），
+	* 把一个网卡的某个接收队列“旁路”给用户态：驱动（或内核的通用 XDP 路径）
+	* 直接通过共享内存环把收到的帧递给用户进程，用户进程也通过共享内存环交包给驱动发送。
+	* 它由三块组成：
+	*   1. UMEM：一块由“用户”分配的连续内存，被切成固定大小的 chunk（frame），
+	*      所有收发数据都放在这里面，内核不会替你再分配包缓冲区；
+	*   2. 四张单生产者/单消费者环（fill / completion / rx / tx），由内核分配、
+	*      用户 mmap 到自己的地址空间，双方通过 read/write 索引交换描述符；
+	*   3. XDP 程序 + XSKMAP：只有网卡入口的 XDP 程序对包执行 XDP_REDIRECT 并把它
+	*      redirect 到本 socket 的 XSKMAP 表项，包才会进入 rx 环（见下面的说明）。
+	*
+	* 二、解决什么问题、什么时候用
+	* 普通 socket 每个包都要经过 skb 分配、协议栈、系统调用；AF_XDP 把这些都绕开，
+	* 用户态批量地看/填共享环即可，单核可以做到每秒千万级包的收发，同时网卡仍由
+	* 内核管理（路由、中断、ethtool 都还在），不像 DPDK 那样独占设备。
+	* 适合：用户态包处理/转发、负载均衡、DNS 之类的高 PPS 服务、抓包加速。
+	* 不适合：吞吐大但包数少的大块传输（这时普通 socket / io_uring 更省事）。
+	*
+	* 三、它的“形态”（重点，和 read/write 式接口完全不同）
+	*   - 数据面没有 read/write/recvfrom/sendto 传数据：数据全部在 UMEM 里，
+	*     双方只交换 16 字节的描述符（xdp_desc：addr 是相对 UMEM 起点的偏移、
+	*     len 是包长、options 是标志）。一次“提交”是往 tx 环里放 N 个描述符，
+	*     对应线上 N 个以太网帧；内核发完后往 completion 环放 N 个 addr 归还缓冲区。
+	*   - 一次 sendto() 不携带数据，只是“踢”内核：告诉它“环里有新东西了，来看一眼”。
+	*   - 一个 UMEM 的 chunk 可以是 2048/4096 字节；默认一个包占一个 chunk，
+	*     巨型帧要开 XDP_USE_SG 才允许多 chunk 拼一个包（本示例不用）。
+	*   - 内存归属：UMEM 由用户提供并负责生命周期；四张环的内核部分由内核分配，
+	*     用户只 mmap 映射。描述符里的 addr 永远是“UMEM 内的偏移”，不是指针。
+	*
+	* 四、四张环的生产者/消费者（本例代码严格按这个方向读写）
+	*   环名          生产者        消费者        放的东西
+	*   fill   (fr)   用户          内核          空闲 frame 的 UMEM 偏移（__u64）
+	*   rx            内核          用户          收到的包（struct xdp_desc）
+	*   tx            用户          内核          要发的包（struct xdp_desc）
+	*   completion(cr)内核          用户          已发完的 frame 偏移（__u64）
+	*   用户侧对 fill/tx 只写 producer，对 rx/completion 只写 consumer；另外各自
+	*   缓存一份对方的索引（cached_*），只有跨过缓存线时才真正读对方的内存。
+	*   环大小是 2 的幂，索引自由回绕，用“无符号减法”算可用槽位。
+	*
+	* 五、前置条件
+	*   - 需要 root 或 CAP_NET_RAW（创建 AF_XDP socket 本身就要）。没有权限时
+	*     socket() 返回 EPERM，本程序会如实打印出来。
+	*   - 网卡驱动要支持 XDP（至少 copy 模式）。lo 这种没有 ndo_bpf 的设备
+	*     bind 可能返回 EOPNOTSUPP，这是设备限制而不是代码问题，注释里已说明。
+	*   - 真正“收”到包还要求接口上挂了 XDP 程序并 redirect 到本 socket 的 XSKMAP；
+	*     本示例只做到 bind（以及 TX 方向发一个包），重定向部分只给说明，见
+	*     setup 末尾的注释块。
+	*
+	* 六、编译与运行
+	*   g++ -std=c++26 -O2 -Wall -Wextra -o /tmp/native_af_xdp af_xdp.cpp
+	*   sudo /tmp/native_af_xdp [网卡名]     # 默认 lo
+	*   预期输出：逐条打印 socket/UMEM/四个环/bind 的结果；root 下在 TX 环提交
+	*   一个 UDP 包（Ethernet + IPv4 + UDP，目标是 127.0.0.1:9999），等 completion
+	*   环把它还回来，最后打印 XDP_STATISTICS。非 root 时在第一步打印 EPERM 退出。
+	*
+	*   实测（WSL2，内核 6.18，lo）：以 root 运行时 bind/提交/TX completion 全部正常；
+	*   但这个注入帧并没有被本机 UDP 栈接收（另开 UDP socket 监听 9999 收不到）。
+	*   帧本身用 AF_PACKET 抓包核对过，格式与校验和正确，丢在哪一段未核对。
+	*   本示例要演示的是 TX 环与 completion 环，不依赖数据真的被应用层收到。
+	*
+	* 七、参考
+	*   /usr/include/linux/if_xdp.h（本机的 UAPI 头，字段/常量以此为准）、
+	*   内核 Documentation/networking/af_xdp.rst。
+	*/
 
 #include <arpa/inet.h>
 #include <linux/if_ether.h>
@@ -79,6 +84,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <optional>
@@ -93,17 +99,17 @@
 namespace {
 
 /* UMEM 里每个 frame 的大小。必须是 2 的幂。
- * 2048 是 copy 模式的常用值（普通以太网帧最大 1518，留有余量）。
- * 注意：内核还要求 chunk_size 不小于某个下限（我记得是 2048）且大于
- * headroom + XDP_PACKET_HEADROOM(256)，此处未在本机核对内核源码。 */
+	* 2048 是 copy 模式的常用值（普通以太网帧最大 1518，留有余量）。
+	* 注意：内核还要求 chunk_size 不小于某个下限（我记得是 2048）且大于
+	* headroom + XDP_PACKET_HEADROOM(256)，此处未在本机核对内核源码。 */
 constexpr std::uint32_t kFrameSize = 2048;
 /* UMEM 中 frame 总数，也是 fill 环的槽位数。必须 <= 环大小。 */
 constexpr std::uint32_t kFrameCount = 128;
 /* 四个环的槽位数，必须是 2 的幂。内核一般要求 64..4096，
- * 具体上下限未在本机核对（本机没有内核源码）。 */
+	* 具体上下限未在本机核对（本机没有内核源码）。 */
 constexpr std::uint32_t kRingEntries = 128;
 /* 前若干个 frame 专门留给 TX，其余投入 fill 环供 RX 使用，避免同一个
- * frame 同时被内核（RX）和用户（TX）写。 */
+	* frame 同时被内核（RX）和用户（TX）写。 */
 constexpr std::uint32_t kTxFrames = 8;
 
 static_assert((kFrameCount & (kFrameCount - 1)) == 0);
@@ -175,8 +181,7 @@ public:
 	mapping &operator=(const mapping &) = delete;
 
 	mapping(mapping &&other) noexcept
-		: base_(std::exchange(other.base_, nullptr)),
-		  len_(std::exchange(other.len_, 0))
+		: base_(std::exchange(other.base_, nullptr)), len_(std::exchange(other.len_, 0))
 	{
 	}
 
@@ -202,7 +207,7 @@ public:
 	std::size_t size() const noexcept { return len_; }
 
 	/* 从基址偏移 off 处取一个 T*。环的 producer/consumer/desc 都是
-	 * getsockopt(XDP_MMAP_OFFSETS) 返回的“页内偏移”，用这个函数定位。 */
+	* getsockopt(XDP_MMAP_OFFSETS) 返回的“页内偏移”，用这个函数定位。 */
 	template <class T>
 	T *at(std::uint64_t off) const noexcept
 	{
@@ -219,15 +224,15 @@ private:
 /* ------------------------------------------------------------------ */
 struct ring {
 	/* producer/consumer 是内核与用户共享的两个 u32，只增不减、自由回绕；
-	 * 判断“空/满”永远用无符号减法，不要直接比较大小。 */
+	* 判断“空/满”永远用无符号减法，不要直接比较大小。 */
 	std::uint32_t *producer = nullptr;
 	std::uint32_t *consumer = nullptr;
 	/* flags：内核往这里写 XDP_RING_NEED_WAKEUP，表示驱动已经睡了，
-	 * 用户提交后必须显式 wakeup（sendto）。仅 bind 时带
-	 * XDP_USE_NEED_WAKEUP 才有意义。 */
+	* 用户提交后必须显式 wakeup（sendto）。仅 bind 时带
+	* XDP_USE_NEED_WAKEUP 才有意义。 */
 	std::uint32_t *flags = nullptr;
 	/* 每个槽位的描述符。fill/completion 环的槽位是 __u64（frame 偏移），
-	 * rx/tx 环的槽位是 struct xdp_desc。 */
+	* rx/tx 环的槽位是 struct xdp_desc。 */
 	std::uint64_t *addrs = nullptr;
 	xdp_desc *descs = nullptr;
 	/* 槽位数 - 1，用于 idx & mask 的回绕。 */
@@ -238,10 +243,10 @@ struct ring {
 };
 
 /* 共享内存里的索引由内核在 C++ 内存模型之外读写。用 atomic_ref 做
- * acquire/release 访问，生成的就是 x86 上的普通 load/store（x86 本身是
- * TSO，release store 不需要额外指令），但语义上把顺序讲清楚了。
- * 严格说，对一个非 _Atomic 对象做 atomic_ref 属于实现相关的用法，
- * 这里是 AF_XDP 用户的通行做法（libbpf 也一样用 __atomic builtin）。 */
+	* acquire/release 访问，生成的就是 x86 上的普通 load/store（x86 本身是
+	* TSO，release store 不需要额外指令），但语义上把顺序讲清楚了。
+	* 严格说，对一个非 _Atomic 对象做 atomic_ref 属于实现相关的用法，
+	* 这里是 AF_XDP 用户的通行做法（libbpf 也一样用 __atomic builtin）。 */
 std::uint32_t load_acquire(const std::uint32_t *p) noexcept
 {
 	return std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t *>(p))
@@ -260,7 +265,7 @@ void store_release(std::uint32_t *p, std::uint32_t v) noexcept
 }
 
 /* 生产方向（fill/tx）：预留 n 个槽位，返回起始下标。
- * 可用槽位 = 环容量 - (本地 producer - 共享 consumer)。 */
+	* 可用槽位 = 环容量 - (本地 producer - 共享 consumer)。 */
 std::optional<std::uint32_t> reserve_prod(ring &r, std::uint32_t n)
 {
 	const std::uint32_t used = r.cached_prod - load_acquire(r.consumer);
@@ -284,7 +289,7 @@ struct cons_batch {
 };
 
 /* 消费方向（rx/completion）：一次拿走最多 max 个已完成项。
- * 返回的 start 是本次批次的起始槽位，count 是数量。 */
+	* 返回的 start 是本次批次的起始槽位，count 是数量。 */
 std::optional<cons_batch> peek_cons(ring &r, std::uint32_t max)
 {
 	const std::uint32_t avail = load_acquire(r.producer) - r.cached_cons;
@@ -308,7 +313,7 @@ bool needs_wakeup(const ring &r) noexcept
 }
 
 /* “踢”内核。参数全为 0/NULL：内核只关心有人调用了 sendto，
- * 并不会把这段参数当数据发出去。环不忙时调用也是安全的。 */
+	* 并不会把这段参数当数据发出去。环不忙时调用也是安全的。 */
 void kick(int fd)
 {
 	// libbpf 的 af_xdp 文档里的标准写法；man 2 sendto 中 length=0 不发送数据。
@@ -319,7 +324,7 @@ void kick(int fd)
 }
 
 /* 标准的 IPv4 头部校验和：16 位反码和再取反。
- * 只算头部（20 字节，偶数长度）；UDP 校验和此处填 0，IPv4 允许。 */
+	* 只算头部（20 字节，偶数长度）；UDP 校验和此处填 0，IPv4 允许。 */
 std::uint16_t ip_checksum(const void *data, std::size_t len)
 {
 	const auto *p = static_cast<const std::uint16_t *>(data);
@@ -336,9 +341,10 @@ std::uint16_t ip_checksum(const void *data, std::size_t len)
 }
 
 /* 构造一个合法的 Ethernet + IPv4 + UDP 帧。
- * 目的地址是全零 MAC（lo 的 MAC）：AF_XDP 的 TX 走 dev_direct_xmit，
- * 帧头必须完整。发往 127.0.0.1:9999，若本机另有 UDP socket 监听该端口
- * 就能收到内容；没有监听时会被内核回一个 ICMP 端口不可达，不影响演示。 */
+	* 目的地址是全零 MAC（lo 的 MAC）：AF_XDP 的 TX 走 dev_direct_xmit，
+	* 帧头必须完整。发往 127.0.0.1:9999。帧格式和校验和都正确，但在 WSL2 的
+	* lo 上实测这个注入帧没有进入本机 UDP 栈（详见文件头“实测”一段），
+	* 所以本示例只用它来观察 TX 环 -> completion 环，不断言应用层能收到。 */
 std::array<std::byte, kDemoFrameLen> build_demo_frame()
 {
 	ethhdr eth{};
@@ -381,8 +387,8 @@ std::array<std::byte, kDemoFrameLen> build_demo_frame()
 }
 
 /* AF_XDP 的一个 socket，连同它的 UMEM 与四张环。
- * 构造即完成“建 socket → 注册 UMEM → 设四个环大小 → mmap 环 → bind”，
- * 任何一步失败抛异常，已取得的资源由 RAII 成员自动释放。 */
+	* 构造即完成“建 socket → 注册 UMEM → 设四个环大小 → mmap 环 → bind”，
+	* 任何一步失败抛异常，已取得的资源由 RAII 成员自动释放。 */
 class xsk_socket {
 public:
 	explicit xsk_socket(std::string_view ifname);
@@ -391,14 +397,14 @@ public:
 	xsk_socket &operator=(const xsk_socket &) = delete;
 
 	/* 把除 TX 保留区以外的 frame 全部放进 fill 环：
-	 * 这是 RX 的前提——内核收到包时要从 fill 环取空闲缓冲区。 */
+	* 这是 RX 的前提——内核收到包时要从 fill 环取空闲缓冲区。 */
 	void fill_all_frames();
 
 	/* 在 tx 环提交一个包；返回 false 表示环满（本演示只发一个，正常不会满）。 */
 	bool send_frame(std::span<const std::byte> frame);
 
 	/* 等 TX completion，返回被归还的 frame 偏移；超时返回 nullopt。
-	 * 每取到一个就把它对应的完成项从 completion 环释放掉。 */
+	* 每取到一个就把它对应的完成项从 completion 环释放掉。 */
 	std::optional<std::uint64_t> wait_tx_completion(std::chrono::milliseconds timeout);
 
 	xdp_statistics statistics() const;
@@ -429,11 +435,12 @@ mapping xsk_socket::map_ring(ring &r, std::uint32_t entries, bool has_desc,
 	// 描述符数组之后可能还有 flags 等字段，所以映射长度要覆盖到 flags。
 	const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
 	std::size_t len = static_cast<std::size_t>(off.flags) + sizeof(std::uint32_t);
-	if (has_desc) {
-		const std::size_t desc_end = static_cast<std::size_t>(off.desc) +
-			static_cast<std::size_t>(entries) * sizeof(xdp_desc);
-		len = std::max(len, desc_end);
-	}
+	// fill/completion 环的槽位是 __u64 地址，rx/tx 环是 16 字节的 xdp_desc；
+	// 两种都要把描述符数组映射进来，只是指针类型不同。
+	const std::size_t elem_size = has_desc ? sizeof(xdp_desc) : sizeof(std::uint64_t);
+	const std::size_t desc_end = static_cast<std::size_t>(off.desc) +
+		static_cast<std::size_t>(entries) * elem_size;
+	len = std::max(len, desc_end);
 	// mmap 的 offset 必须是页对齐的；XDP_PGOFF_* 都满足。
 	len = (len + page - 1) & ~(page - 1);
 
@@ -725,6 +732,7 @@ int main(int argc, char **argv)
 			st.tx_ring_empty_descs);
 	} catch (const std::exception &e) {
 		// 所有资源已在栈展开时由 RAII 释放：环 munmap、UMEM munmap、fd close。
+		std::fflush(stdout); // 先刷出前面打印的步骤，避免与 stderr 乱序
 		std::println(stderr, "失败：{}", e.what());
 		return 1;
 	}

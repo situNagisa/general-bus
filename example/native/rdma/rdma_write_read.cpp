@@ -14,31 +14,31 @@ RECV WR，也收不到任何“接收完成项”。
 
 【形态】
 	- 一次 ibv_post_send 仍然可以交一整条 WR 链；每个 WR 是一次独立的
-		WRITE 或 READ，对应线上一个 RDMA 消息（会被拆成多个 MTU 大小的包）。
+	WRITE 或 READ，对应线上一个 RDMA 消息（会被拆成多个 MTU 大小的包）。
 	- 每个 WR 可带多个 SGE：
-		WRITE：SGE 描述本地要发出的若干段（scatter/gather），写到对端的是
-				从 remote_addr 开始的一段连续内存。
-		READ ：SGE 描述本地接收数据的若干段，从对端的 remote_addr 开始连续读取。
+	WRITE：SGE 描述本地要发出的若干段（scatter/gather），写到对端的是
+		从 remote_addr 开始的一段连续内存。
+	READ ：SGE 描述本地接收数据的若干段，从对端的 remote_addr 开始连续读取。
 	- 完成：只有本地 CQ 上一个完成项（需 IBV_SEND_SIGNALED），opcode 为
-		IBV_WC_RDMA_WRITE / IBV_WC_RDMA_READ；对端没有任何完成项、没有中断。
-		READ 的 CQE 里 byte_len 是实际读到的字节数；WRITE 的 byte_len 无意义。
+	IBV_WC_RDMA_WRITE / IBV_WC_RDMA_READ；对端没有任何完成项、没有中断。
+	READ 的 CQE 里 byte_len 是实际读到的字节数；WRITE 的 byte_len 无意义。
 	- 内存：两端都得在各自的 PD 里注册 MR。对端的 MR 必须带
-		IBV_ACCESS_REMOTE_WRITE（被 WRITE）/ IBV_ACCESS_REMOTE_READ（被 READ）；
-		否则请求会在对端被拒绝，发起方拿到 IBV_WC_REM_ACCESS_ERR。
+	IBV_ACCESS_REMOTE_WRITE（被 WRITE）/ IBV_ACCESS_REMOTE_READ（被 READ）；
+	否则请求会在对端被拒绝，发起方拿到 IBV_WC_REM_ACCESS_ERR。
 	- WRITE 完成（收到 ACK）即意味着数据已经落在对端内存里；但对端 CPU 要
-		“看见”它仍需同步（通常用另一个 SEND 送一个“已完成”标记，或轮询标志位）。
+	“看见”它仍需同步（通常用另一个 SEND 送一个“已完成”标记，或轮询标志位）。
 
 【需要的内核/硬件条件】
 	- 真实 RDMA 网卡，或 soft-RoCE（rdma_rxe）。WSL2 一般两者都没有，本程序
-		会在 ibv_get_device_list 为空时打印提示退出。
+	会在 ibv_get_device_list 为空时打印提示退出。
 
 【本示例做什么】
 	在同一个进程里建一个 RC QP 并自连（loopback），把一块注册为“对端内存”
 	的缓冲区当作远端：
-		1) RDMA_WRITE 把自己的字符串写进去（不发 RECV WR，验证照样完成）；
-		2) RDMA_READ 读回来，校验内容；
-		3) 故意 READ 一块只注册了本地权限的 MR，观察 IBV_WC_REM_ACCESS_ERR，
-			以及 QP 进入 IBV_QPS_ERR。
+	1) RDMA_WRITE 把自己的字符串写进去（不发 RECV WR，验证照样完成）；
+	2) RDMA_READ 读回来，校验内容；
+	3) 故意 READ 一块只注册了本地权限的 MR，观察 IBV_WC_REM_ACCESS_ERR，
+		以及 QP 进入 IBV_QPS_ERR。
 
 【编译】
 	g++ -std=c++26 -O2 -Wall -Wextra -o /tmp/native_rdma_write_read \
@@ -249,8 +249,8 @@ int main()
 	// 对端要能被 RDMA_WRITE 和 RDMA_READ，所以两个 REMOTE_* 权限都要。
 	// REMOTE_WRITE 是最危险的一项权限：拿到 rkey 的人可以直接改你的内存。
 	Mr peer_mr{ibv_reg_mr(pd.get(), peer.data(), peer.size(),
-					IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-						IBV_ACCESS_REMOTE_READ)};
+		IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+		IBV_ACCESS_REMOTE_READ)};
 	if (!peer_mr) {
 		std::fprintf(stderr, "reg_mr(peer) 失败: %s\n", std::strerror(errno));
 		return EXIT_FAILURE;
@@ -305,10 +305,10 @@ int main()
 		attr.pkey_index = 0;
 		attr.port_num = kPort;
 		attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-						IBV_ACCESS_REMOTE_READ;
+			IBV_ACCESS_REMOTE_READ;
 		if (ibv_modify_qp(qp.get(), &attr,
-					IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-						IBV_QP_ACCESS_FLAGS) != 0) {
+			IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+			IBV_QP_ACCESS_FLAGS) != 0) {
 			std::fprintf(stderr, "modify_qp(INIT) 失败: %s\n", std::strerror(errno));
 			return EXIT_FAILURE;
 		}
@@ -334,7 +334,7 @@ int main()
 			// RoCE 没有 LID，必须用 GID 路由：is_global=1 让 AV 携带 GRH。
 			if (ibv_query_gid(ctx.get(), kPort, 0, &gid) != 0) {
 				std::fprintf(stderr, "ibv_query_gid 失败: %s\n",
-							std::strerror(errno));
+				std::strerror(errno));
 				return EXIT_FAILURE;
 			}
 			attr.ah_attr.is_global = 1;
@@ -347,9 +347,9 @@ int main()
 		}
 
 		if (ibv_modify_qp(qp.get(), &attr,
-					IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-						IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
-						IBV_QP_MIN_RNR_TIMER) != 0) {
+			IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+			IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+			IBV_QP_MIN_RNR_TIMER) != 0) {
 			std::fprintf(stderr, "modify_qp(RTR) 失败: %s\n", std::strerror(errno));
 			return EXIT_FAILURE;
 		}
@@ -365,9 +365,9 @@ int main()
 		attr.rnr_retry = 7;
 		attr.max_rd_atomic = 1;
 		if (ibv_modify_qp(qp.get(), &attr,
-					IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
-						IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-						IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
+			IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+			IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+			IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
 			std::fprintf(stderr, "modify_qp(RTS) 失败: %s\n", std::strerror(errno));
 			return EXIT_FAILURE;
 		}
@@ -386,7 +386,7 @@ int main()
 	//   wr.rdma.rkey        = 对端 MR 的 rkey（来自 peer_mr->rkey）
 	// 对端不需要任何 RECV WR——这正是与 SEND 的根本区别。
 	// =================================================================
-	std::memcpy(local.data(), "hello via RDMA_WRITE, no peer CPU involved!", kLen);
+	std::snprintf(local.data(), kLen, "hello via RDMA_WRITE, no peer CPU involved!");
 	std::printf("\n--- 1) RDMA_WRITE %zu 字节 到 peer[0] ---\n", kLen);
 
 	ibv_sge write_sge{};
@@ -470,8 +470,8 @@ int main()
 	print_wc(wcs[0]);
 	// READ 成功时 byte_len 应该等于请求长度；READ 的 CQE 也用于传递“读到了多少”。
 	const bool read_ok = wcs[0].status == IBV_WC_SUCCESS &&
-					wcs[0].byte_len == kLen &&
-					std::memcmp(local.data() + kReadbackOff, local.data(), kLen) == 0;
+			wcs[0].byte_len == kLen &&
+			std::memcmp(local.data() + kReadbackOff, local.data(), kLen) == 0;
 	std::printf("  读回内容: \"%.*s\"（校验 %s）\n",
 		static_cast<int>(kLen), local.data() + kReadbackOff,
 		read_ok ? "通过" : "失败");
@@ -522,15 +522,15 @@ int main()
 		ibv_qp_attr qa{};
 		ibv_qp_init_attr qi{};
 		if (ibv_query_qp(qp.get(), &qa, IBV_QP_STATE, &qi) == 0) {
-			std::printf("  出错后 QP 状态: %d（%s，5=IBV_QPS_ERR，需要 reset 才能复用）\n",
-					static_cast<int>(qa.qp_state),
-					qa.qp_state == IBV_QPS_ERR ? "IBV_QPS_ERR" : "其它");
+			std::printf("  出错后 QP 状态: %d（%s，6=IBV_QPS_ERR，需要 reset 才能复用）\n",
+				static_cast<int>(qa.qp_state),
+				qa.qp_state == IBV_QPS_ERR ? "IBV_QPS_ERR" : "其它");
 		}
 	}
 
 	std::printf("\n完成：WRITE %s，READ %s，权限拒绝 %s\n",
-			write_ok ? "成功" : "失败", read_ok ? "成功" : "失败",
-			perm_ok ? "符合预期" : "不符合预期");
+		write_ok ? "成功" : "失败", read_ok ? "成功" : "失败",
+		perm_ok ? "符合预期" : "不符合预期");
 	// RAII 析构顺序：qp → cq → ro_mr → peer_mr → local_mr → pd → ctx。
 	return (write_ok && read_ok && perm_ok) ? EXIT_SUCCESS : EXIT_FAILURE;
 }

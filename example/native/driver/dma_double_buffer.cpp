@@ -15,7 +15,7 @@
 //   - CT 位指示“当前正在写哪一块”：CT=0 写 M0AR，CT=1 写 M1AR。
 //     硬件在每块传输完成时翻转 CT；软件只能在 EN=0 时写 CT。
 //   - 使能 DBM 后循环模式自动生效（RM0090：CIRC 位无关，硬件按双缓冲一直轮转），
-//     所以只需要武装一次。
+//     所以只需要武装一次。（本机没有 RM 原文，这句未逐页核对。）
 //
 // ── TC 中断里到底哪块是“刚填满的” ──
 // 关键时序：一块搬完的瞬间，硬件先把 CT 翻到另一块，再置 TCIF。等 CPU 进中断时，
@@ -47,13 +47,13 @@
 //
 // ── 硬件/软件条件 ──
 // - STM32F4/F7，CMSIS 头；ADC1 的 4 个通道接 PA0..PA3，连续转换 + 扫描。
-// - DMA2 Stream0 通道 0；DBM 在该 Stream 上可用。
+// - DMA2 Stream0 通道 0（映射表未核对）；DBM 在该 Stream 上可用。
 // - F7 开 D-Cache 时，DMA 缓冲要放 non-cacheable 区或做 cache 维护。
 //
 // ── 编译与运行 ──
-//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb \
-//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld \
-//       startup_stm32f4xx.s dma_double_buffer.cpp -o dma_double_buffer.o
+//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb
+//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld
+//       startup_stm32f4xx.s dma_double_buffer.cpp -o dma_double_buffer.elf
 // 烧录后通过 SWO/ITM 看输出。预期输出每块一行，m0/m1 是当前两个槽位指向的
 // 池下标，可以看到它们在 4 个缓冲之间轮转：
 //   block 1: sum=... | m0=2 m1=1 late=0
@@ -138,6 +138,9 @@ void adc_init() noexcept {
 	(void)RCC->AHB1ENR;
 	(void)RCC->APB2ENR;
 
+	// ADC 时钟由 ADC->CCR 的 ADCPRE 分频，F4 上不能超过 36 MHz；
+	// 本示例假设板级初始化已把它设到合规频率（例如 PCLK2/4 = 21 MHz）。
+
 	GPIOA->MODER |= GPIO_MODER_MODER0 | GPIO_MODER_MODER1 |
 		GPIO_MODER_MODER2 | GPIO_MODER_MODER3;
 
@@ -151,7 +154,8 @@ void adc_init() noexcept {
 	ADC1->SQR3 = (0U << ADC_SQR3_SQ1_Pos) | (1U << ADC_SQR3_SQ2_Pos) |
 		(2U << ADC_SQR3_SQ3_Pos) | (3U << ADC_SQR3_SQ4_Pos);
 
-	for (volatile std::uint32_t i = 0; i < 1000; ++i) {
+	for (std::uint32_t i = 0; i < 1000; ++i) {
+		__NOP();
 	}
 }
 
@@ -220,10 +224,10 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 		// 现在是哪块在写说不清，按旧 CT 换指针可能改到正在写的槽位。
 		// 放弃这次换指针，等下一次（挂起的 TC 会再进中断）。
 		if ((DMA2_Stream0->CR & DMA_SxCR_CT) != ct_at_entry) {
-			++g_late;
+			g_late = g_late + 1;
 			return;
 		}
-		++g_blocks;
+		g_blocks = g_blocks + 1;
 
 		// 从空闲队列取一块新缓冲，换到“当前不用”的槽位：
 		// CT=1 时 DMA 正在写 M1AR，只能改 M0AR；CT=0 时反之。
@@ -248,16 +252,16 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 	// 真实驱动应把错误上报给 link，并决定是否丢弃当前数据。
 	if (sr & DMA_LISR_TEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CTEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 		dma_start();
 	}
 	if (sr & DMA_LISR_DMEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CDMEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 	}
 	if (sr & DMA_LISR_FEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CFEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 	}
 }
 

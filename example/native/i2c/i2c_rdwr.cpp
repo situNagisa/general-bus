@@ -8,7 +8,8 @@
 *	1 次 ioctl → N 条 i2c_msg → 线上 START 段1 Sr 段2 Sr … 段N STOP
 *	N 最多 I2C_RDWR_IOCTL_MAX_MSGS = 42（/usr/include/linux/i2c-dev.h）。
 * 相邻两条消息之间由内核发 repeated START（Sr），只有最后一条后面发 STOP。
-* 因此整个调用在总线层面是原子的：内核持有适配器锁，别的 I2C 传输插不进来。
+* 内核在整次 i2c_transfer 期间持有适配器总线锁，别的 I2C 传输插不进来
+* （内核实现细节，未核对本机 6.18 版本）。
 *
 * 【形态】
 *	一次 ioctl 交进去：1 个 struct i2c_rdwr_ioctl_data（里面是 i2c_msg 数组指针 + 条数）。

@@ -46,16 +46,17 @@
 //
 // ── 硬件/软件条件 ──
 // - STM32F4/F7，CMSIS 头；USART1_RX 接 PA10（AF7），波特率 115200。
-// - USART1_RX → DMA2 Stream2 通道 4（也可用 Stream5 通道 4）。
+// - USART1_RX → DMA2 Stream2 通道 4（也可用 Stream5 通道 4；映射按 RM0090，
+//   本机未核对原文）。
 // - NDTR 是 16 位，所以环大小不能超过 65535；这里用 256。
 // - F7 开 D-Cache 时，g_ring 必须放 non-cacheable 区，或在读之前 invalidate，
 //   否则 CPU 可能读到 cache 里的旧数据。F4 无 D-Cache。
 // - F7 的 USART 寄存器改名：SR→ISR，DR→RDR，清 IDLE 改成写 USART_ICR_IDLECF；
-//   本文件按 F4 的 SR/DR 写法，F7 移植时替换这几处即可。
+//   本文件按 F4 的 SR/DR 写法，F7 移植时替换这几处即可（F7 名字未核对）。
 //
 // ── 编译与运行 ──
-//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb \
-//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld \
+//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb
+//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld
 //       startup_stm32f4xx.s uart_dma_ring.cpp -o uart_dma_ring.elf
 // 烧录后从 PC 串口助手发数据，通过 SWO/ITM 看输出。预期输出每次线空闲一行：
 //   event 1: 1 segment, 5 bytes (5+0) total=5
@@ -124,8 +125,8 @@ void link_receive(std::span<const std::uint8_t> first,
 	g_last_len[0] = n0;
 	g_last_len[1] = n1;
 	g_last_segments = second.empty() ? 1U : 2U;
-	g_bytes += n0 + n1;
-	++g_events;
+	g_bytes = g_bytes + n0 + n1;
+	g_events = g_events + 1;
 }
 
 // 在 IDLE 中断里调用：读 NDTR 得到写指针，和上次读指针比较，切成 1 或 2 段。
@@ -221,11 +222,15 @@ extern "C" void USART1_IRQHandler(void) {
 		(void)USART1->DR;
 
 		publish_from_isr();
-	} else if (sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) {
-		// ORE（溢出）等错误也是读 SR 再读 DR 清除。这里只计数；
-		// ORE 说明 DMA 没跟上或环被绕满，真实驱动应上报 link。
-		(void)USART1->DR;
-		++g_uart_errors;
+	}
+
+	if (sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) {
+		// ORE（溢出）等错误也是读 SR 再读 DR 清除。IDLE 分支已经读过 DR 时
+		// 不再重复读，避免多消费一次数据。真实驱动应上报 link。
+		if (!(sr & USART_SR_IDLE)) {
+			(void)USART1->DR;
+		}
+		g_uart_errors = g_uart_errors + 1;
 	}
 }
 

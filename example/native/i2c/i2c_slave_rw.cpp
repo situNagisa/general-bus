@@ -33,8 +33,9 @@
 *	一次 write() = 1 条 i2c_msg = 线上一个完整的 START → 地址+W → 数据… → STOP。
 *	一次 read()  = 1 条 i2c_msg = 线上一个完整的 START → 地址+R → 数据… → STOP。
 *	一次调用提交一次、同步阻塞完成；返回时数据已经拷回用户缓冲，没有队列、没有异步接口。
-*	缓冲由用户提供；i2c-dev 在 ioctl 内部用 memdup_user() 拷进内核缓冲并标成 DMA 安全，
-*	所以用户缓冲不需要对齐，但每次传输都多一次拷贝。
+*	缓冲由用户提供；内核需要一份自己的缓冲来完成传输（i2c-dev.c 里 read() 用 kzalloc、
+*	write() 用 memdup_user），所以每次调用都有一次用户↔内核拷贝；用户缓冲不需要对齐。
+*	（I2C_RDWR 路径会额外给消息标 I2C_M_DMA_SAFE，见 i2c_rdwr.cpp。）
 *	单次 read()/write() 的字节数上限是 8192，超过会被 i2c-dev 直接截断到 8192
 *	（drivers/i2c/i2c-dev.c：`if (count > 8192) count = 8192;`）。
 *	read()/write() 是“裸 I2C”；也支持 ioctl(I2C_SMBUS) 的 SMBus 子集，本文件不涉及。

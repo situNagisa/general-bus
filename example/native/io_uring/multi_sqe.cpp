@@ -18,7 +18,7 @@
 	*     （流式套接字会粘包/短读，见文末说明）。
 	*
 	* 三、内核条件
-	*   - 内核 >= 5.1；不需要特殊硬件。
+	*   - 内核 >= 5.6（IORING_OP_RECV、IORING_OP_SEND 自 5.6 起）；不需要特殊硬件。
 	*
 	* 四、编译与运行
 	*   g++ -std=c++26 -O2 -Wall -Wextra -o multi_sqe multi_sqe.cpp -luring
@@ -245,8 +245,8 @@ int main()
 		}
 
 		// 每处理完一个就立刻归还槽位。也可以攒一批再 seen，
-		// 但绝不能忘记：CQ 环满（2 * SQ 容量）后内核将停止投递完成，
-		// wait 会永远阻塞。
+		// 但绝不能忘记：CQ 槽位耗尽会让内核进入 overflow，长期不收割
+		// 最终连 submit 都会失败（-EBUSY，见 IORING_FEAT_NODROP）。
 		ring.cqe_seen(cqe);
 	}
 
@@ -260,12 +260,12 @@ int main()
 		static_cast<unsigned>(received[0] == kOutgoing[0]) + static_cast<unsigned>(received[1] == kOutgoing[0]),
 		static_cast<unsigned>(received[0] == kOutgoing[1]) + static_cast<unsigned>(received[1] == kOutgoing[1]));
 
-	// 更省事的批量收割写法（本例为了逐条讲解才用循环）：
-	//   unsigned head;
-	//   struct io_uring_cqe *cqe;
-	//   unsigned n = 0;
-	//   io_uring_for_each_cqe(&ring, head, cqe) {
-	//       /* 处理 cqe */ ++n;
+	// 更省事的批量收割写法（本例为了逐条讲解才用循环）。
+	// 这里的 ring 指底层的 io_uring 实例（本例封装在 Ring 类里）：
+	//   unsigned head, n = 0;
+	//   struct io_uring_cqe *c;
+	//   io_uring_for_each_cqe(&ring, head, c) {
+	//       /* 处理 c */ ++n;
 	//   }
 	//   io_uring_cq_advance(&ring, n);   // 一次性推进 head，减少原子写
 	// 高吞吐场景推荐这种写法。

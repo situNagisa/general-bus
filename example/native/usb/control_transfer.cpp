@@ -313,8 +313,14 @@ static int get_device_descriptor_urb(int fd, std::span<std::byte> out)
 	// 想超时就用 REAPURBNDELAY + 自己定时轮询，见 bulk_urb.cpp）。
 	// 返回的指针就是你提交的那个，内核不做拷贝。
 	usbdevfs_urb *done = nullptr;
+	int rc;
 
-	if (::ioctl(fd, USBDEVFS_REAPURB, &done) < 0)
+	// 被信号打断时（EINTR）URB 仍在途，不能放弃，重试直到拿到结果。
+	do {
+		rc = ::ioctl(fd, USBDEVFS_REAPURB, &done);
+	} while (rc < 0 && errno == EINTR);
+
+	if (rc < 0)
 		throw errno_error("USBDEVFS_REAPURB", errno);
 	if (done != &urb)
 		throw SysError(std::format("收割到意外的 URB {}（期望 {}）",

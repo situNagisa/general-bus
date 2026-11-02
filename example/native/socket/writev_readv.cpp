@@ -23,7 +23,7 @@ writev / readv —— 一次系统调用提交多段内存（scatter/gather）
 	内存：iovec 数组和每段缓冲区都由调用者提供，且必须在该调用返回前保持有效
 	（内核在系统调用期间直接读取 iovec 并访问缓冲区）。
 
-需要的 内核/硬件条件
+需要的内核/硬件条件
 	无特殊条件。Linux 的段数上限是 UIO_MAXIOV = 1024（见
 	/usr/include/linux/uio.h），glibc 通过 limits.h 暴露为 IOV_MAX = 1024
 	（见 /usr/include/bits/uio_lim.h），运行时可用 sysconf(_SC_IOV_MAX) 查询。
@@ -35,7 +35,7 @@ writev / readv —— 一次系统调用提交多段内存（scatter/gather）
 
 预期输出（TCP 回环，数值随内核缓冲略有浮动）
 	[writev] IOV_MAX = 1024，本次使用 5 段，共 204800 字节
-	[writev] 第 1 次调用返回 8192 ...（短写，后面继续）
+	[writev] 第 1 次调用返回一个小于总量的值（短写，后面继续）
 	... 若干次 EAGAIN 后边读边写 ...
 	[writev] 完成：... 次调用，... 次短写，... 次 EAGAIN，校验 OK
 	[readv] 第一次 readv 返回 1200：本次各段填充 [1000, 200, 0]
@@ -109,7 +109,7 @@ private:
 [[noreturn]] static void die(std::string_view what)
 {
 	std::fprintf(stderr, "%.*s 失败: %s\n", static_cast<int>(what.size()),
-		     what.data(), std::strerror(errno));
+				what.data(), std::strerror(errno));
 	std::exit(EXIT_FAILURE);
 }
 
@@ -207,8 +207,8 @@ static char segment_fill(size_t index)
 该段的期望值。TCP 没有消息边界，只能在知道各段长度的前提下这样校验。
 */
 static void verify_stream(std::span<const char> data,
-			  const std::vector<size_t> &seg_lens,
-			  size_t &pos, size_t &errors)
+				const std::vector<size_t> &seg_lens,
+				size_t &pos, size_t &errors)
 {
 	for (char c : data) {
 		size_t acc = 0;
@@ -253,7 +253,7 @@ static void demo_writev(unsigned int nseg)
 	if (fl < 0 || fcntl(srv.get(), F_SETFL, fl | O_NONBLOCK) < 0)
 		die("fcntl(O_NONBLOCK)");
 
-	/* 第 i 段长度不同，总量约 160 KB，确保远大于发送缓冲区 */
+	/* 第 i 段长度不同，总量约 200 KB，确保远大于发送缓冲区 */
 	std::vector<size_t> seg_lens;
 	seg_lens.reserve(nseg);
 	for (unsigned int i = 0; i < nseg; i++)
@@ -273,7 +273,7 @@ static void demo_writev(unsigned int nseg)
 		total += segs[i].size();
 	}
 	std::println("[writev] IOV_MAX = {}，本次使用 {} 段，共 {} 字节",
-		     sysconf(_SC_IOV_MAX), nseg, total);
+				sysconf(_SC_IOV_MAX), nseg, total);
 
 	/*
 	校验状态：pos 是已从对端读到的字节数。注意 pos 同时也是全局流位置，
@@ -293,7 +293,7 @@ static void demo_writev(unsigned int nseg)
 			ssize_t r = recv(cli.get(), rbuf.data(), rbuf.size(), MSG_DONTWAIT);
 			if (r > 0) {
 				verify_stream(std::span{rbuf.data(), static_cast<size_t>(r)},
-					      seg_lens, pos, errors);
+							seg_lens, pos, errors);
 				got += static_cast<size_t>(r);
 				continue;
 			}
@@ -323,10 +323,10 @@ static void demo_writev(unsigned int nseg)
 			break;
 		/*
 		writev 的返回值：
-		  >0 : 本次写出的总字节数，可能小于 left（短写），也可能正好写满；
-		  -1 : 错误。EAGAIN/EWOULDBLOCK 表示非阻塞发送缓冲区已满；
-		       EINTR 表示被信号打断，应重试；EPIPE 表示对端已关闭
-		       （此时若没忽略 SIGPIPE，进程会先被信号杀死）。
+			>0 : 本次写出的总字节数，可能小于 left（短写），也可能正好写满；
+			-1 : 错误。EAGAIN/EWOULDBLOCK 表示非阻塞发送缓冲区已满；
+				EINTR 表示被信号打断，应重试；EPIPE 表示对端已关闭
+				（此时若没忽略 SIGPIPE，进程会先被信号杀死）。
 		注意它绝不会告诉你每段各写了多少——下面用 print_fill 自己算。
 		*/
 		ssize_t r = writev(srv.get(), iov.data(), static_cast<int>(iov.size()));
@@ -339,7 +339,7 @@ static void demo_writev(unsigned int nseg)
 				++eagains;
 				/*
 				缓冲区满：先读走对端数据（同时校验），再等发送端
-				重新可写。只忙轮询会空转几万次，poll(POLLOUT) 更贴近
+				重新可写。只忙轮询会空转很多次，poll(POLLOUT) 更贴近
 				真实的非阻塞写法。100 ms 只是演示用的上限。
 				*/
 				drain_peer();
@@ -362,7 +362,7 @@ static void demo_writev(unsigned int nseg)
 			std::println("，剩余 {} 字节", left - n);
 		}
 		/*
-		关键步骤：writev 只返回总数，用 advance 按各段长度推进。
+		关键步骤：writev 只返回总数，用 advance_iov 按各段长度推进。
 		如果忘了推进，下一轮会把同一批数据从头再写一遍。
 		*/
 		advance_iov(iov, n);
@@ -388,12 +388,12 @@ static void demo_writev(unsigned int nseg)
 		if (r == 0)
 			die("对端提前关闭");
 		verify_stream(std::span{rbuf.data(), static_cast<size_t>(r)},
-			      seg_lens, pos, errors);
+					seg_lens, pos, errors);
 	}
 
 	std::println("[writev] 完成：写出 {} 字节，{} 次调用，{} 次短写，{} 次 EAGAIN，收到 {} 字节，校验 {}",
-		     written, calls, short_writes, eagains, pos,
-		     errors == 0 ? "OK" : "失败");
+				written, calls, short_writes, eagains, pos,
+				errors == 0 ? "OK" : "失败");
 
 	/*
 	边界演示：段数超过 IOV_MAX 时内核直接拒绝。这里用 IOV_MAX+1 个
@@ -403,17 +403,17 @@ static void demo_writev(unsigned int nseg)
 	std::vector<iovec> too_many(static_cast<size_t>(iov_max) + 1, iovec{nullptr, 0});
 	errno = 0;
 	ssize_t r = writev(srv.get(), too_many.data(),
-			   static_cast<int>(too_many.size()));
+				static_cast<int>(too_many.size()));
 	std::println("[IOV_MAX] writev(iovcnt={}) 返回 {}，errno={}（{}）",
-		     too_many.size(), r, errno, std::strerror(errno));
+				too_many.size(), r, errno, std::strerror(errno));
 }
 
 /*
 readv 演示：两次读取，观察 readv 返回值如何分摊到各段。
 	第一次：对端已有 1200 字节，但请求 3 段共 3000 字节；
-	        返回 1200 -> 段 0 填满 1000，段 1 填 200，段 2 为 0。
+			返回 1200 -> 段 0 填满 1000，段 1 填 200，段 2 为 0。
 	第二次：对端再发 1300 字节；
-	        返回 1300 -> 段 1 再填 800（填满），段 2 填 500。
+			返回 1300 -> 段 1 再填 800（填满），段 2 填 500。
 TCP 是字节流，readv 只保证 "有多少给多少"，不保证填满所有段，
 所以必须按返回值推进 iovec 并循环读。
 */
@@ -440,9 +440,9 @@ static void demo_readv()
 		while (want > 0) {
 			/*
 			readv 的返回值同样只是一个总字节数：
-			  >0 : 本次读进各段的总字节数，可能没有填满所有段；
-			   0 : 对端有序关闭（EOF），TCP 上表示不会再有数据；
-			  -1 : 错误，EINTR 重试，EAGAIN 表示暂时无数据。
+				>0 : 本次读进各段的总字节数，可能没有填满所有段；
+				0 : 对端有序关闭（EOF），TCP 上表示不会再有数据；
+				-1 : 错误，EINTR 重试，EAGAIN 表示暂时无数据。
 			*/
 			ssize_t r = readv(cli.get(), iov.data(), static_cast<int>(iov.size()));
 			if (r < 0) {
@@ -501,7 +501,7 @@ static void demo_readv()
 	recv_stage(second.size(), "第二次");
 
 	std::println("[readv] 共收到 {} 字节，数据校验 {}", received,
-		     errors == 0 ? "OK" : "失败");
+				errors == 0 ? "OK" : "失败");
 }
 
 int main(int argc, char **argv)

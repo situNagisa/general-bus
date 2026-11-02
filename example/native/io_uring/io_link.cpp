@@ -13,7 +13,7 @@
 	*
 	* IOSQE_IO_HARDLINK 是它的“硬链接”版本：同样串行，但某一项失败不会
 	* 打断链，后面的项照样执行（只有提交阶段就失败的父请求才会断链）。
-	* HARDLINK 隐含 LINK，两者不能同时用。
+	* HARDLINK 隐含 LINK，不必再额外设置 LINK 位。
 	*
 	* IORING_OP_LINK_TIMEOUT 是专门给“链上前一项”设超时的操作：把它的 SQE
 	* 紧跟在目标 SQE 后面、并让目标带 IOSQE_IO_LINK。超时到期就取消目标；
@@ -24,8 +24,9 @@
 	*   - 一次 submit 提交整条链（链不能跨 submission 边界！最后一个 SQE
 	*     即使带 LINK 也会被当作链尾）。本例每次 submit 2 个 SQE；
 	*   - 链内 N 个操作串行执行，正常情况产生 N 个 CQE；失败时被取消的项
-	*     也会各产生一个 -ECANCELED 的 CQE（除非它同时带了
-	*     IOSQE_CQE_SKIP_SUCCESS，见 cqe_skip_success.cpp）；
+	*     也会各产生一个 -ECANCELED 的 CQE。例外：如果断链的那个失败请求
+	*     自己带了 IOSQE_CQE_SKIP_SUCCESS 且链上没有 HARDLINK，后续被取消
+	*     成员的 CQE 会被省略（见 cqe_skip_success.cpp）；
 	*   - 数据缓冲区、超时用的 __kernel_timespec 都由应用提供，必须活到
 	*     对应 CQE 被收割；
 	*   - “线上单元”：本例仍是一条 UNIX 域 DGRAM 连接，每个操作对应一条
@@ -34,6 +35,8 @@
 	* 三、内核条件
 	*   - IOSQE_IO_LINK 需要内核 >= 5.3；
 	*   - IOSQE_IO_HARDLINK、IORING_OP_LINK_TIMEOUT 需要内核 >= 5.5；
+	*   - 本例还用 IORING_OP_RECV 和 IORING_OP_CLOSE（均自 5.6 起），
+	*     所以实际要求内核 >= 5.6；
 	*   - 不需要特殊硬件。
 	*
 	* 四、编译与运行
@@ -247,7 +250,7 @@ void demo_link_success()
 			got = std::string_view{bufs[idx].data(), static_cast<std::size_t>(cqe->res)};
 		print_cqe(order, cqe, idx == 0 ? "recv #1" : "recv #2",
 			cqe->res >= 0 ? std::string_view{std::format(" 内容=\"{}\"", got)} : std::string_view{});
-		// 上面 std::format 生成的临时 string 在 println 前有效；
+		// 上面 std::format 生成的临时 string 在 print_cqe 调用期间有效；
 		// 为了示例可读性这里直接内联，实际项目里注意临时对象生命周期。
 		ring.cqe_seen(cqe);
 	}
@@ -268,15 +271,17 @@ void demo_link_failure()
 
 	io_uring_sqe *sqe = ring.get_sqe();
 	// 用 close(-1) 制造一个确定性的失败（-EBADF）。真实场景可能是
-	// connect 失败、fsync 失败、短读等——io_uring 把“非预期结果”都算失败，
-	// 包括比预期短的读。
+	// connect 失败、fsync 失败等。man page 说链中“非预期结果”都算失败，
+	// 具体什么算失败与 opcode 有关。
 	io_uring_prep_close(sqe, -1);
 	sqe->flags |= IOSQE_IO_LINK;
 	io_uring_sqe_set_data64(sqe, 0xb);
 
+	std::array<char, 16> buf{};
+
 	sqe = ring.get_sqe();
-	io_uring_prep_recv(sqe, rx.get(), nullptr, 0, 0);
-	// 缓冲区传 nullptr/0 也无所谓：它永远不会被启动。
+	io_uring_prep_recv(sqe, rx.get(), buf.data(), buf.size(), 0);
+	// 这块缓冲区不会被写入：前一项失败后本请求直接被取消，从不启动。
 	io_uring_sqe_set_data64(sqe, 0xc);
 
 	int submitted = ring.submit();
@@ -385,6 +390,9 @@ void demo_link_timeout()
 
 	// 如果 recv 先完成（本例不可能，因为没写数据），timeout SQE 会得到
 	// -ECANCELED 而不是 -ETIME，recv 正常返回字节数。
+	//
+	// 本机 6.18 实测：定时器 SQE 自身也会产生一个 CQE（-ETIME），所以这里
+	// 一共收割 2 个。更老内核是否同样会为 link timeout 投递 CQE，未核对。
 	//
 	// 注意：只有“可中断”的操作能可靠取消（socket 读写、accept 等）；
 	// 已经进入块层的磁盘 I/O 无法撤销，超时只能等它完成。

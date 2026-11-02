@@ -108,7 +108,7 @@ private:
 [[noreturn]] static void die(std::string_view what)
 {
 	std::fprintf(stderr, "%.*s 失败: %s\n", static_cast<int>(what.size()),
-		     what.data(), std::strerror(errno));
+				what.data(), std::strerror(errno));
 	std::exit(EXIT_FAILURE);
 }
 
@@ -176,10 +176,10 @@ static void demo_tcp()
 	std::array<char, 64> buf{};
 	/*
 	recv 的返回值：
-	  >0 : 实际拷贝到 buf 的字节数，可能小于 buf.size()，这不是错误；
-	   0 : 有序关闭（对端发了 FIN）。TCP 上这是 EOF，此后不会再有数据；
-	  -1 : 错误。EINTR 表示被信号打断，通常应重试；EAGAIN/EWOULDBLOCK
-	       表示非阻塞模式下暂时没有数据。
+		>0 : 实际拷贝到 buf 的字节数，可能小于 buf.size()，这不是错误；
+		0 : 有序关闭（对端发了 FIN）。TCP 上这是 EOF，此后不会再有数据；
+		-1 : 错误。EINTR 表示被信号打断，通常应重试；EAGAIN/EWOULDBLOCK
+			表示非阻塞模式下暂时没有数据。
 	注意 TCP 是字节流：一次 send 的 9 字节并不保证一次 recv 就能收全，
 	也可能和后续 send 的数据粘在一起。这里先 send 后 recv 且数据量小，
 	才有 "一次 recv 拿到 9 字节" 的结果。
@@ -188,7 +188,7 @@ static void demo_tcp()
 	if (n < 0)
 		die("recv(TCP)");
 	std::println("[TCP] recv 返回 {}，内容 \"{}\"", n,
-		     std::string_view{buf.data(), static_cast<size_t>(n)});
+				std::string_view{buf.data(), static_cast<size_t>(n)});
 
 	/*
 	关闭 server 端。close 会让内核在对端方向排入 FIN；没有未发送数据时，
@@ -267,7 +267,7 @@ static void demo_udp()
 		（sendmsg/recvmsg 的示例会用 MSG_TRUNC 观察这件事）。
 		*/
 		std::println("[UDP] 第 {} 次 recv 返回 {}，内容 \"{}\"", i + 1, n,
-			     std::string_view{buf.data(), static_cast<size_t>(n)});
+					std::string_view{buf.data(), static_cast<size_t>(n)});
 	}
 
 	/*
@@ -289,7 +289,7 @@ static void demo_udp()
 	if (n < 0)
 		die("recv(UDP pong)");
 	std::println("[UDP] 再收一次仍有数据：{} 字节 \"{}\"", n,
-		     std::string_view{buf.data(), static_cast<size_t>(n)});
+				std::string_view{buf.data(), static_cast<size_t>(n)});
 }
 
 int main()

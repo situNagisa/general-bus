@@ -4,10 +4,10 @@ sendmsg / recvmsg —— 带对端地址与辅助数据（cmsg）的收发
 这个接口是什么、解决什么问题
 	sendmsg()/recvmsg() 是 send/recv 的 "完整形态"：除了多段内存（iovec，
 	和 writev/readv 一样），它还接收/返回
-	  - 对端地址（msg_name）：在未连接的 UDP 套接字上一次调用就能指定目的地；
-	  - 辅助数据（msg_control 里的 cmsg）：随数据报一起传递的控制信息，如
-	    数据报到达的本地地址/接口（IP_PKTINFO）、内核收包时间戳（SO_TIMESTAMP）、
-	    显式拥塞通知、源地址选择等。
+		- 对端地址（msg_name）：在未连接的 UDP 套接字上一次调用就能指定目的地；
+		- 辅助数据（msg_control 里的 cmsg）：随数据报一起传递的控制信息，如
+		数据报到达的本地地址/接口（IP_PKTINFO）、内核收包时间戳（SO_TIMESTAMP）、
+		显式拥塞通知、源地址选择等。
 	它解决的正是 "消息之外还带有元数据" 的问题：这些信息无法塞进字节流，
 	也不该被当作普通数据，cmsg 让内核和应用在同一次调用里交换它们。
 
@@ -19,9 +19,9 @@ sendmsg / recvmsg —— 带对端地址与辅助数据（cmsg）的收发
 
 形态（本接口的关键约束）
 	sendmsg：n 段内存 + 1 个目标地址 + m 个 cmsg -> 1 次提交，
-	         对应 1 个 UDP 数据报（或 TCP 字节流的一段），1 次完成。
+				对应 1 个 UDP 数据报（或 TCP 字节流的一段），1 次完成。
 	recvmsg：n 段内存 + 1 个地址输出缓冲 + 1 个控制信息输出缓冲 -> 1 次提交，
-	         取走 1 个数据报，1 次完成。
+				取走 1 个数据报，1 次完成。
 	内存：iovec 数组、每段数据缓冲、sockaddr、控制缓冲全部由调用者提供；
 	内核只在调用期间访问它们，返回后不再引用。
 	返回值只报告 "数据拷贝了多少字节"；地址长度写在 msg_namelen，
@@ -110,7 +110,7 @@ private:
 [[noreturn]] static void die(std::string_view what)
 {
 	std::fprintf(stderr, "%.*s 失败: %s\n", static_cast<int>(what.size()),
-		     what.data(), std::strerror(errno));
+				what.data(), std::strerror(errno));
 	std::exit(EXIT_FAILURE);
 }
 
@@ -137,8 +137,8 @@ static const char *ip_str(const in_addr &a, char (&buf)[INET_ADDRSTRLEN])
 	返回实际发送的字节数。
 */
 static ssize_t send_datagram(int fd, const sockaddr_in &dst,
-			     std::span<const std::string_view> parts,
-			     bool with_src)
+					std::span<const std::string_view> parts,
+					bool with_src)
 {
 	/* iovec 数组必须覆盖所有段；段数在运行时决定 */
 	std::array<iovec, 4> iov{};
@@ -198,7 +198,7 @@ static ssize_t send_datagram(int fd, const sockaddr_in &dst,
 }
 
 /*
-接收一个数据报并打印地址与全部 cmsg。
+接收一个数据报，填充源地址、msg_flags 和控制信息。
 	control_size：控制缓冲可用长度，用来演示 MSG_CTRUNC。
 	返回数据字节数；msg_flags 通过引用带出。
 */
@@ -217,9 +217,6 @@ static ssize_t recv_one(int fd, std::span<char> data,
 	*/
 	msg.msg_name = &from;
 	msg.msg_namelen = from_len;
-	msg.msg_iov = nullptr;
-	msg.msg_iovlen = 0;
-	(void)data;
 
 	/* 数据段由调用者提供；这里只收 1 段，但 recvmsg 天然支持多段。 */
 	iovec iov{data.data(), data.size()};
@@ -236,11 +233,11 @@ static ssize_t recv_one(int fd, std::span<char> data,
 
 	/*
 	recvmsg 的返回值：
-	  >0 : 拷贝进 iovec 的数据字节数。对 UDP 是 "本次数据报被拷贝的部分"：
-	       缓冲够大就是完整数据报长度；缓冲太小则只拷贝缓冲大小，
-	       并在 msg_flags 里置 MSG_TRUNC（见后面的演示）。
-	   0 : UDP 上是零长度数据报；TCP 上才是对端关闭（EOF）。
-	  -1 : 错误，EINTR 应重试，EAGAIN 表示非阻塞下暂无数据。
+		>0 : 拷贝进 iovec 的数据字节数。对 UDP 是 "本次数据报被拷贝的部分"：
+			缓冲够大就是完整数据报长度；缓冲太小则只拷贝缓冲大小，
+			并在 msg_flags 里置 MSG_TRUNC（见后面的演示）。
+		0 : UDP 上是零长度数据报；TCP 上才是对端关闭（EOF）。
+		-1 : 错误，EINTR 应重试，EAGAIN 表示非阻塞下暂无数据。
 	*/
 	ssize_t n = recvmsg(fd, &msg, 0);
 	if (n < 0)
@@ -259,31 +256,33 @@ static void dump_cmsgs(msghdr &msg)
 	对齐填充，且顺序由内核决定。CMSG_NXTHDR 会正确处理这些。
 	*/
 	for (cmsghdr *cm = CMSG_FIRSTHDR(&msg); cm != nullptr;
-	     cm = CMSG_NXTHDR(&msg, cm)) {
+			cm = CMSG_NXTHDR(&msg, cm)) {
 		if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO) {
 			in_pktinfo pi{};
 			std::memcpy(&pi, CMSG_DATA(cm), sizeof pi);
 			char dst[INET_ADDRSTRLEN];
 			char local[INET_ADDRSTRLEN];
 			std::println("[recvmsg]   IP_PKTINFO: ifindex={} 目的地址={} 本地地址={}",
-				     pi.ipi_ifindex,
-				     ip_str(pi.ipi_addr, dst),
-				     ip_str(pi.ipi_spec_dst, local));
+						pi.ipi_ifindex,
+						ip_str(pi.ipi_addr, dst),
+						ip_str(pi.ipi_spec_dst, local));
 			/*
 			ipi_addr    ：数据报头里的目的地址（多宿主/广播时有用）；
 			ipi_spec_dst：内核选出的本地地址（常用于回填源地址）；
 			ipi_ifindex ：收到该包的接口索引。
+			字段名见 /usr/include/linux/in.h；语义按 ip(7)，本机未装 man page，
+			未逐条核对。
 			*/
 		} else if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_TIMESTAMP) {
 			timeval tv{};
 			/* SO_TIMESTAMP 交付的是 struct timeval；长度可用 cmsg_len 校验 */
 			std::memcpy(&tv, CMSG_DATA(cm), sizeof tv);
 			std::println("[recvmsg]   SCM_TIMESTAMP: {}.{:06}", tv.tv_sec,
-				     static_cast<long>(tv.tv_usec));
+						static_cast<long>(tv.tv_usec));
 		} else {
 			std::println("[recvmsg]   未知 cmsg: level={} type={} len={}",
-				     cm->cmsg_level, cm->cmsg_type,
-				     static_cast<size_t>(cm->cmsg_len));
+						cm->cmsg_level, cm->cmsg_type,
+						static_cast<size_t>(cm->cmsg_len));
 		}
 	}
 }
@@ -315,7 +314,7 @@ int main()
 	if (setsockopt(rfd.get(), SOL_SOCKET, SO_TIMESTAMP, &on, sizeof on) < 0)
 		die("setsockopt(SO_TIMESTAMP)");
 	std::println("[setup] 接收端 127.0.0.1:{}，已开启 IP_PKTINFO 和 SO_TIMESTAMP",
-		     ntohs(raddr.sin_port));
+				ntohs(raddr.sin_port));
 
 	/* 发送端：不 connect，每次 sendmsg 自己给 msg_name */
 	Fd sfd{socket(AF_INET, SOCK_DGRAM, 0)};
@@ -346,17 +345,17 @@ int main()
 	const std::array<std::string_view, 2> parts{"sendmsg", "-demo"};
 	ssize_t sent = send_datagram(sfd.get(), raddr, parts, false);
 	std::println("[sendmsg] 两段共 {} 字节 -> 1 个数据报，返回 {}",
-		     parts[0].size() + parts[1].size(), sent);
+				parts[0].size() + parts[1].size(), sent);
 
 	ssize_t n = recv_one(rfd.get(), buf, sizeof cbuf.bytes, flags, from,
-			     from_len, cbuf, msg);
+					from_len, cbuf, msg);
 	char src[INET_ADDRSTRLEN];
 	std::println("[recvmsg] 返回 {}，来自 {}:{}，msg_flags=0x{:x}", n,
-		     ip_str(from.sin_addr, src), ntohs(from.sin_port), flags);
+				ip_str(from.sin_addr, src), ntohs(from.sin_port), flags);
 	std::println("[recvmsg] 数据: \"{}\"",
-		     std::string_view{buf.data(), static_cast<size_t>(n)});
+				std::string_view{buf.data(), static_cast<size_t>(n)});
 	std::println("[recvmsg] 控制信息 {} 字节，共解析出 cmsg：",
-		     msg.msg_controllen);
+				msg.msg_controllen);
 	dump_cmsgs(msg);
 	/*
 	msg_flags 是 "输出" 字段：recvmsg 返回后由内核填写，表示本次接收的
@@ -372,12 +371,12 @@ int main()
 	const std::array<std::string_view, 1> part2{"pktinfo-src"};
 	sent = send_datagram(sfd.get(), raddr, part2, true);
 	std::println("[sendmsg] 带 IP_PKTINFO cmsg 发送 {} 字节，返回 {}",
-		     part2[0].size(), sent);
+				part2[0].size(), sent);
 
 	n = recv_one(rfd.get(), buf, sizeof cbuf.bytes, flags, from, from_len,
-		     cbuf, msg);
+				cbuf, msg);
 	std::println("[recvmsg] 返回 {}，源端口 {}（发送端绑定的是 {}）", n,
-		     ntohs(from.sin_port), ntohs(laddr.sin_port));
+				ntohs(from.sin_port), ntohs(laddr.sin_port));
 	dump_cmsgs(msg);
 
 	/*
@@ -394,9 +393,9 @@ int main()
 
 	std::array<char, 16> small{};
 	n = recv_one(rfd.get(), small, sizeof cbuf.bytes, flags, from, from_len,
-		     cbuf, msg);
+				cbuf, msg);
 	std::println("[MSG_TRUNC] 16 字节缓冲 recvmsg 返回 {}，msg_flags=0x{:x}（MSG_TRUNC={}）",
-		     n, flags, (flags & MSG_TRUNC) ? 1 : 0);
+				n, flags, (flags & MSG_TRUNC) ? 1 : 0);
 
 	/*
 	演示 3b：在 flags 参数里传 MSG_TRUNC，返回值变成数据报的真实长度
@@ -421,7 +420,7 @@ int main()
 		die("recvmsg(MSG_TRUNC)");
 	flags = msg.msg_flags;
 	std::println("[MSG_TRUNC] 传 MSG_TRUNC 标志后返回 {}（真实长度），msg_flags=0x{:x}",
-		     n, flags);
+				n, flags);
 	/* 对比：返回值是 100，但缓冲只有 16，只能安全使用前 16 字节。 */
 
 	/*
@@ -436,7 +435,7 @@ int main()
 	std::array<char, 64> databuf{};
 	n = recv_one(rfd.get(), databuf, 16, flags, from, from_len, cbuf, msg);
 	std::println("[MSG_CTRUNC] 数据返回 {} 字节，msg_flags=0x{:x}（MSG_CTRUNC={}），msg_controllen={}",
-		     n, flags, (flags & MSG_CTRUNC) ? 1 : 0, msg.msg_controllen);
+				n, flags, (flags & MSG_CTRUNC) ? 1 : 0, msg.msg_controllen);
 	/*
 	CMSG_FIRSTHDR 在剩余空间不足一个 cmsghdr 时返回 nullptr，所以这里
 	不调用 dump_cmsgs；正确做法是按需用 CMSG_SPACE 放大控制缓冲。

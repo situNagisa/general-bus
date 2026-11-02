@@ -26,7 +26,7 @@
 	*     槽位，不拥有这些内存。
 	*
 	* 三、内核条件
-	*   - 内核 >= 5.1（io_uring 和 IORING_OP_RECV 都是 5.1 引入）；
+	*   - 内核 >= 5.6（io_uring 本体自 5.1 起，IORING_OP_RECV 自 5.6 起）；
 	*   - 不需要特殊硬件；本机 WSL2 内核 6.18 直接可跑。
 	*
 	* 四、编译与运行
@@ -109,8 +109,10 @@ public:
 	explicit Ring(unsigned entries)
 	{
 		// entries：期望的 SQ 槽位数，内核会向上取整到 2 的幂；
-		// CQ 环容量固定是它的 2 倍（内核保证完成不会因为应用来不及收割
-		// 而丢，除非溢出，见 io_uring_setup 手册）。
+		// 默认 CQ 容量是它的 2 倍（本机实测 entries=8 → CQ 16；
+		// 以初始化后 sq/cq 的 ring_entries 为准）。
+		// 若应用长期不收割，CQ 会 overflow：支持 IORING_FEAT_NODROP 的
+		// 内核先把完成暂存在内部，overflow 列表也满时 submit 返回 -EBUSY。
 		// flags：0 表示默认的中断驱动模式；IORING_SETUP_SQPOLL 等模式见
 		// io_uring_setup(2)，本例不需要。
 		int ret = io_uring_queue_init(entries, &ring_, 0);

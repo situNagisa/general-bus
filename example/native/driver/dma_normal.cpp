@@ -21,6 +21,7 @@
 // 哪个外设接在哪个控制器的哪个 Stream 的哪个通道，是芯片数据手册里的固定表，
 // 不能随便改。本文件用 ADC1：
 //   ADC1 → DMA2 Stream0 通道 0（也可以换成 DMA2 Stream4 通道 0）。
+// （映射表按 RM0090 写，本机没有 RM 原文，未逐页核对。）
 // 选错 Stream/通道，DMA 会一直等不到请求，看起来像“永远不进中断”。
 //
 // ── 普通模式（normal mode）的形态 ──
@@ -28,7 +29,8 @@
 // 产生一次传输完成（TC）中断，并且硬件自动把 EN 清 0、停下来。要收下一批，
 // 软件必须重新写 NDTR（以及需要的 M0AR/PAR）再置 EN。也就是说：
 //   提交一次 → 完成一次 → 重新提交 → 再完成一次……
-// 内存由驱动提供（这里的 g_dma_buf 是静态数组），link 只拿到一份视图/快照。
+// 每次完成交给 link 的是 1 段 N 个采样的内存。缓冲区由驱动提供（这里的
+// g_dma_buf 是静态数组），link 只拿到一份视图/快照，不拥有它。
 //
 // ── 这个模式的致命点：停下到重启之间会丢数据 ──
 // TC 之后 DMA 已经停了，但 ADC 还在连续转换。转换结果不断覆盖 ADC->DR，
@@ -46,8 +48,8 @@
 //   MPU 配置的 non-cacheable 区，要么在中断里做 cache invalidate。F4 没有 D-Cache。
 //
 // ── 编译与运行 ──
-//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb \
-//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld \
+//   arm-none-eabi-g++ -std=c++26 -O2 -mcpu=cortex-m4 -mthumb
+//       -ffreestanding -fno-exceptions -fno-rtti -T stm32f4.ld
 //       startup_stm32f4xx.s dma_normal.cpp -o dma_normal.elf
 //   （工具链要支持 -std=c++26；老工具链换成 -std=c++2b 也能编过。）
 // 烧录后通过 SWO/ITM 看输出（ITM_SendChar 只在调试器打开 ITM 时才有输出）。
@@ -139,6 +141,9 @@ void adc_init() noexcept {
 	(void)RCC->AHB1ENR;
 	(void)RCC->APB2ENR;
 
+	// ADC 时钟由 ADC->CCR 的 ADCPRE 分频，F4 上不能超过 36 MHz；
+	// 本示例假设板级初始化已把它设到合规频率（例如 PCLK2/4 = 21 MHz）。
+
 	// MODER 每 2 位一个引脚，11 = 模拟模式。模拟输入不需要上下拉。
 	GPIOA->MODER |= GPIO_MODER_MODER0 | GPIO_MODER_MODER1 |
 		GPIO_MODER_MODER2 | GPIO_MODER_MODER3;
@@ -164,7 +169,8 @@ void adc_init() noexcept {
 		(2U << ADC_SQR3_SQ3_Pos) | (3U << ADC_SQR3_SQ4_Pos);
 
 	// ADON 置位后 ADC 需要 tSTAB 才稳定；这里用空循环粗等，正式代码可用定时器。
-	for (volatile std::uint32_t i = 0; i < 1000; ++i) {
+	for (std::uint32_t i = 0; i < 1000; ++i) {
+		__NOP();
 	}
 }
 
@@ -205,20 +211,22 @@ void dma_arm() noexcept {
 	while (!(DMA2_Stream0->CR & DMA_SxCR_EN)) {
 	}
 
-	++g_rearms;
+	g_rearms = g_rearms + 1;
 }
 
 // 驱动与 link 的边界：link 只看到一段 4 个采样的内存，不知道它来自 DMA。
 // 真实 link 会在这里把段提交给执行器；本示例直接打印，方便观察。
-void link_publish(std::span<const sample_t> frame) noexcept {
+// rearm/gap 由主循环在同一临界区里取快照后传入，避免打印时和中断打架。
+void link_publish(std::span<const sample_t> frame, std::uint32_t frames,
+	std::uint32_t rearm, std::uint32_t gap) noexcept {
 	char line[160];
 	std::snprintf(line, sizeof line,
 		"frame %lu: %u %u %u %u | rearm=%lu max_gap=%lu cycles\n",
-		static_cast<unsigned long>(g_frames),
+		static_cast<unsigned long>(frames),
 		static_cast<unsigned>(frame[0]), static_cast<unsigned>(frame[1]),
 		static_cast<unsigned>(frame[2]), static_cast<unsigned>(frame[3]),
-		static_cast<unsigned long>(g_rearms),
-		static_cast<unsigned long>(g_max_gap_cycles));
+		static_cast<unsigned long>(rearm),
+		static_cast<unsigned long>(gap));
 	trace(line);
 }
 
@@ -247,7 +255,7 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 		// 先拷贝成稳定快照，再重新武装；顺序反过来会让 DMA 在新一帧里
 		// 覆盖正在拷贝的内容。
 		std::copy(g_dma_buf.begin(), g_dma_buf.end(), g_frame.begin());
-		++g_frames;
+		g_frames = g_frames + 1;
 
 		// 重新提交。这一句返回前，ADC 产生的新采样都进不了内存。
 		dma_arm();
@@ -263,7 +271,7 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 	// 计数后重新武装，让采集继续；真实驱动应把错误上报给 link。
 	if (sr & DMA_LISR_TEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CTEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 		dma_arm();
 	}
 
@@ -271,11 +279,11 @@ extern "C" void DMA2_Stream0_IRQHandler(void) {
 	// 但共享标志还是要清，否则会一直进中断。
 	if (sr & DMA_LISR_DMEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CDMEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 	}
 	if (sr & DMA_LISR_FEIF0) {
 		DMA2->LIFCR = DMA_LIFCR_CFEIF0;
-		++g_errors;
+		g_errors = g_errors + 1;
 	}
 }
 
@@ -298,12 +306,16 @@ int main() {
 	for (;;) {
 		std::array<sample_t, kChannels> frame{};
 		std::uint32_t frames;
+		std::uint32_t rearm;
+		std::uint32_t gap;
 		{
 			// 关中断取快照：g_frame/g_frames 由中断更新，主循环读的时候
 			// 不能被 TC 中断打断，否则可能拿到半新半旧的一帧。
 			irq_lock lock;
 			frame = g_frame;
 			frames = g_frames;
+			rearm = g_rearms;
+			gap = g_max_gap_cycles;
 		}
 
 		if (frames == shown) {
@@ -315,6 +327,6 @@ int main() {
 
 		// 这里就是“把一段内存交给 link”的位置：span 只借用，
 		// link 返回后 frame 是主循环的局部变量，驱动不再持有它。
-		link_publish(frame);
+		link_publish(frame, frames, rearm, gap);
 	}
 }

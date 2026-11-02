@@ -15,54 +15,57 @@
 	只有从错误队列读到覆盖该 send 调用的完成通知后，才能安全复用。
 	完成通知也不等于“对端收到”，它只表示内核放开了这些页。
 
-	  send() 返回           完成通知到达
-	      |                      |
-	      v                      v
-	  buf 不能改  --------->  buf 可以复用（也可能可以更早，但不可依赖）
+	send() 返回           完成通知到达
+	|                      |
+	v                      v
+	buf 不能改  --------->  buf 可以复用（也可能可以更早，但不可依赖）
 
 	三、形态
-	  - 一次 send 调用交 1 段用户内存（sendmsg 可带 iovec 数组，多段时的
-	    通知粒度本示例未涉及，未核对）。
-	  - 线上单元：TCP 按 MSS 切成多个 skb；UDP 按 MTU 分片，一个数据报
-	    可能对应多个 skb。完成通知与线上单元无关。
-	  - 提交：每次成功的 send 调用在 socket 内部计数器上 +1（按调用次数，
-	    不按字节数，见内核文档 Documentation/networking/msg_zerocopy.rst）。
-	  - 完成：内核把连续完成的调用合并成一条通知，用 [ee_info, ee_data]
-	    这个闭区间表示一批 send 调用；所以“提交 N 次”可能只收到几条通知。
-	  - 内存：由调用者提供，内核只 pin 不复制，直到通知到达才放开。
-	  - 失败：send 返回 -1/ENOBUFS 表示超过 socket 的 optmem 限制或进程的
-	    RLIMIT_MEMLOCK；不是“零拷贝不可用”，而是这次没排上。
+	- 一次 send 调用交 1 段用户内存（sendmsg 可带 iovec 数组，多段时的
+	通知粒度本示例未涉及，未核对）。
+	- 线上单元：TCP 按 MSS 切成多个 skb；UDP 按 MTU 分片，一个数据报
+	可能对应多个 skb。完成通知与线上单元无关。
+	- 提交：每次成功的 send 调用在 socket 内部计数器上 +1（按调用次数，
+	不按字节数，见内核文档 Documentation/networking/msg_zerocopy.rst）。
+	- 完成：内核把连续完成的调用合并成一条通知，用 [ee_info, ee_data]
+	这个闭区间表示一批 send 调用；所以“提交 N 次”可能只收到几条通知。
+	- 内存：由调用者提供，内核只 pin 不复制，直到通知到达才放开。
+	- 失败：send 返回 -1/ENOBUFS 表示超过 socket 的 optmem 限制或进程的
+	RLIMIT_MEMLOCK；不是“零拷贝不可用”，而是这次没排上。
 
 	四、需要的条件
-	  - 内核 >= 4.14（SO_ZEROCOPY 与 MSG_ZEROCOPY 都是 4.14 引入）。
-	  - 仅 AF_INET / AF_INET6 的 SOCK_STREAM / SOCK_DGRAM（AF_VSOCK 的
-	    virtio 传输也支持）。AF_UNIX 上 setsockopt(SO_ZEROCOPY) 会失败。
-	  - 必须先 setsockopt(SO_ZEROCOPY, 1) 表明意图；否则内核静默忽略
-	    MSG_ZEROCOPY（避免老程序误传标志就改变语义）。
-	  - 读错误队列：TCP 直接可用；UDP 需要额外打开 IP_RECVERR（man ip(7)，
-	    本机没有 man page，未核对）。
-	  - 回环上的特殊行为：内核文档明确写了，MSG_ZEROCOPY 发往本机 socket
-	    的包一律会做一次“延迟拷贝”（否则接收方不读时页引用永远不释放），
-	    并在 ee_code 里置 SO_EE_CODE_ZEROCOPY_COPIED。所以本示例在回环上
-	    运行时看到“内核其实做了拷贝”是预期结果，不是失败。
+	- 内核 >= 4.14（SO_ZEROCOPY 与 MSG_ZEROCOPY 都是 4.14 引入）。
+	- 仅 AF_INET / AF_INET6 的 SOCK_STREAM / SOCK_DGRAM（AF_VSOCK 的
+	virtio 传输也支持）。AF_UNIX 上 setsockopt(SO_ZEROCOPY) 会失败。
+	- 必须先 setsockopt(SO_ZEROCOPY, 1) 表明意图；否则内核静默忽略
+	MSG_ZEROCOPY（避免老程序误传标志就改变语义）。
+	- 读错误队列：TCP 直接可用；UDP 需要额外打开 IP_RECVERR（man ip(7)，
+	本机没有 man page，未核对）。
+	- 回环上的特殊行为：内核文档（msg_zerocopy.rst）写明，MSG_ZEROCOPY
+	发往本机 socket 的包会做一次“延迟拷贝”（否则接收方不读时页引用
+	永远不释放）。文档说这种情况下用 ee_code 的 SO_EE_CODE_ZEROCOPY_COPIED
+	告知进程；但本机 6.18 WSL2 回环实测没有收到这个标记（未核对具体
+	内核路径），所以示例把两种结果都正常处理。
 
 	五、编译与运行
-	  g++ -std=c++26 -O2 -Wall -Wextra -o /tmp/native_msg_zerocopy msg_zerocopy.cpp
-	  /tmp/native_msg_zerocopy
-	  不需要额外链接库（std::thread 没用；只用同步 API）。
+	g++ -std=c++26 -O2 -Wall -Wextra -o /tmp/native_msg_zerocopy msg_zerocopy.cpp
+	/tmp/native_msg_zerocopy
+	不需要额外链接库（std::thread 没用；只用同步 API）。
 
 	六、预期输出（回环）
-	  == SO_ZEROCOPY 演示：16 次 64 KiB 的 send(MSG_ZEROCOPY) ==
-	  ...
-	  send() 全部返回（1 MiB 已交给内核），此刻 buf 还不能改写
-	  接收端收满 1048576 字节，校验和一致
-	  完成通知 [1, 16]：覆盖 16 次 send
-	  含 SO_EE_CODE_ZEROCOPY_COPIED：回环上内核退化成了拷贝（预期）
-	  收到全部完成通知，现在才允许改写 buf
+	== SO_ZEROCOPY 演示：16 次 64 KiB 的 send(MSG_ZEROCOPY) ==
+	...
+	send() 全部返回：16 次调用、1048576 字节已交给内核，耗时 ...
+	此刻 buf 仍不能改写：内核可能还引用着这些页
+	接收端收满 1048576 字节，校验和一致
+	完成通知 [0, 7]：覆盖 8 次 send
+	完成通知 [8, 15]：覆盖 8 次 send
+	共 2 条通知覆盖 16 次 send；...
+	从 send 返回到完成通知到齐：...
+	收到全部完成通知，现在才允许改写 buf（已清零）
 */
 
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <linux/errqueue.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -80,6 +83,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -144,7 +148,9 @@ constexpr std::size_t kTotalBytes = kChunk * kCount;
 /*
 	FNV-1a 64 位，用来校验接收端拿到的字节和发送前完全一致。
 */
-std::uint64_t fnv1a(std::span<const std::byte> data, std::uint64_t h = 1469598103934665603ull)
+constexpr std::uint64_t kFnvOffset = 1469598103934665603ull;
+
+std::uint64_t fnv1a(std::span<const std::byte> data, std::uint64_t h = kFnvOffset)
 {
 	for (const std::byte b : data) {
 		h ^= static_cast<std::uint8_t>(b);
@@ -270,35 +276,31 @@ bool wait_error_queue(int fd, int timeout_ms)
 }
 
 /*
-	把接收端已经到达的数据都读走，更新计数与校验和；EAGAIN 就返回。
-	conn 设成非阻塞，这样“顺手排空”不会卡住发送循环。
+	接收端线程：读满 total 字节并算校验和。
+	接收必须放在独立线程里：64 KiB 的 send 在发送缓冲满时会阻塞，而唯一
+	能腾空发送缓冲的读操作如果排在 send 后面，就会死锁（同一个线程）。
+	这也是真实程序里“发送与接收分开”的常见理由。
 */
-void drain_some(int fd, std::span<std::byte> scratch, std::size_t &received, std::uint64_t &hash)
+std::uint64_t recv_hash_exact(int fd, std::size_t total)
 {
-	for (;;) {
-		const ssize_t n = ::recv(fd, scratch.data(), scratch.size(), MSG_DONTWAIT);
+	std::array<std::byte, 64 * 1024> buf{};
+	std::size_t got = 0;
+	std::uint64_t h = kFnvOffset;
+	while (got < total) {
+		const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return;
 			die("recv");
 		}
 		if (n == 0) {
-			std::fputs("接收端提前看到 EOF\n", stderr);
+			std::fprintf(stderr, "接收端提前 EOF：%zu / %zu\n", got, total);
 			std::exit(EXIT_FAILURE);
 		}
-		const auto got = static_cast<std::size_t>(n);
-		hash = fnv1a({scratch.data(), got}, hash);
-		received += got;
+		h = fnv1a({buf.data(), static_cast<std::size_t>(n)}, h);
+		got += static_cast<std::size_t>(n);
 	}
-}
-
-void set_nonblocking(int fd)
-{
-	const int flags = ::fcntl(fd, F_GETFL, 0);
-	check(flags >= 0, "fcntl(F_GETFL)");
-	check(::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0, "fcntl(F_SETFL, O_NONBLOCK)");
+	return h;
 }
 
 } // namespace
@@ -327,8 +329,9 @@ int main()
 		return EXIT_FAILURE;
 	}
 
-	// 接收端设非阻塞，便于在发送间隙“顺手”排空，避免发送缓冲被填满。
-	set_nonblocking(conn.get());
+	// 接收端线程先跑起来：它负责把发送缓冲持续腾空，避免 send 死锁。
+	std::uint64_t recv_hash = 0;
+	std::thread rx([&] { recv_hash = recv_hash_exact(conn.get(), kTotalBytes); });
 
 	// ---- 3. 准备数据。发送前填好，之后直到完成通知到来前都不许改 ----
 	std::vector<std::byte> arena(kTotalBytes);
@@ -336,10 +339,6 @@ int main()
 		arena[i] = static_cast<std::byte>((i * 131 + 7) & 0xff);
 	const std::span<std::byte> all{arena};
 	const std::uint64_t expected_hash = fnv1a(all);
-
-	std::array<std::byte, 64 * 1024> scratch{};
-	std::size_t received = 0;
-	std::uint64_t recv_hash = 1469598103934665603ull;
 
 	// ---- 4. 逐块发送，每次 send 都带 MSG_ZEROCOPY ----
 	std::size_t sends = 0;	// 成功的 send 调用次数 = 预期完成数（未合并时）
@@ -370,8 +369,6 @@ int main()
 			++sends;
 		}
 
-		// 发送间隙排空接收端：回环上不排空会把发送缓冲填满，send 阻塞。
-		drain_some(conn.get(), scratch, received, recv_hash);
 	}
 
 	const auto t_sent = std::chrono::steady_clock::now();
@@ -381,19 +378,9 @@ int main()
 			std::chrono::duration_cast<std::chrono::microseconds>(t_sent - t0).count()));
 	std::puts("此刻 buf 仍不能改写：内核可能还引用着这些页");
 
-	// ---- 5. 把接收端剩下的数据收完（保证连接健康、数据真的到过对端） ----
-	while (received < kTotalBytes) {
-		drain_some(conn.get(), scratch, received, recv_hash);
-		if (received >= kTotalBytes)
-			break;
-		pollfd pfd{conn.get(), POLLIN, 0};
-		const int r = ::poll(&pfd, 1, 2000);
-		if (r <= 0) {
-			std::fprintf(stderr, "等待接收数据超时，已收 %zu / %zu\n", received, kTotalBytes);
-			return EXIT_FAILURE;
-		}
-	}
-	std::printf("接收端收满 %zu 字节，校验和%s\n", received,
+	// ---- 5. 等接收端读满，确认数据真的、完整地到达过对端 ----
+	rx.join();
+	std::printf("接收端收满 %zu 字节，校验和%s\n", kTotalBytes,
 		recv_hash == expected_hash ? "一致" : "不一致（数据被破坏了！）");
 	check(recv_hash == expected_hash, "接收数据校验");
 
@@ -438,9 +425,10 @@ int main()
 	}
 	const auto t_done = std::chrono::steady_clock::now();
 
+	// 没有 COPIED 标记不等于“一定没拷贝”：每次通知只表示内核放开了页。
 	std::printf("共 %zu 条通知覆盖 %zu 次 send；%s\n", notifications, completed,
-		saw_copied ? "出现 SO_EE_CODE_ZEROCOPY_COPIED（回环上必然如此）"
-			   : "全部按零拷贝完成");
+		saw_copied ? "出现 SO_EE_CODE_ZEROCOPY_COPIED（内核用延迟拷贝收尾）"
+			: "未出现 COPIED 标记（是否拷贝过以驱动/内核路径为准）");
 	std::printf("从 send 返回到完成通知到齐：%lld µs\n",
 		static_cast<long long>(
 			std::chrono::duration_cast<std::chrono::microseconds>(t_done - t_sent).count()));
@@ -454,16 +442,17 @@ int main()
 	/*
 		常见坑：
 		1. 忘记 setsockopt(SO_ZEROCOPY)：内核不报错，悄悄退回拷贝，
-		   程序以为在零拷贝。
+		程序以为在零拷贝。
 		2. 把 send 返回当成可复用：产生偶发的“数据错乱”，且只在网卡
-		   忙/重传时才出现，极难查。
+		忙/重传时才出现，极难查。
 		3. 只读一次错误队列：通知会被合并、会乱序，也可能在对端关闭时
-		   丢失；正确做法是按区间累计，直到覆盖所有成功的 send。关闭
-		   socket 会丢弃未读通知，所以复用 buf 前必须先读完。
+		丢失；正确做法是按区间累计，直到覆盖所有成功的 send。关闭
+		socket 会丢弃未读通知，所以复用 buf 前必须先读完。
 		4. 小块数据用零拷贝往往更慢：pin 页、错误队列通知的开销按“次”
-		   计，10KB 以下通常不如直接拷贝。
-		5. 回环/本机 socket 一定会退化成延迟拷贝，这是内核文档写明的；
-		   想观察真正的零拷贝要跨机器，或换支持 SG 的网卡。
+		计，10KB 以下通常不如直接拷贝。
+		5. 回环/本机 socket 按内核文档会退化成延迟拷贝；想观察真正的
+		零拷贝要跨机器，或换支持 SG 的网卡。本机实测没有 COPIED 标记，
+		说明不能靠这个标记反推“绝对没有拷贝”。
 		6. send 返回 ENOBUFS 是资源限制，不是参数错误；需要重试或回退。
 	*/
 	return 0;

@@ -191,7 +191,7 @@ private:
 	int fd_ = -1;
 };
 
-// 打开 /dev/bus/usb/BBB/DDD。路径里的 BUG/DDD 是十进制补零三位，和 lsusb
+// 打开 /dev/bus/usb/BBB/DDD。路径里的 BBB/DDD 是十进制补零三位，和 lsusb
 // 的 Bus/Device 一致。打不开时把 errno 翻成人话再抛出。
 static UniqueFd open_device(std::string_view path)
 {
@@ -461,6 +461,19 @@ static int cancel_and_reap(int fd, std::array<IoRequest<Size>, Count> &reqs)
 		--pending;
 		++reaped;
 	}
+
+	// 超时说明内核仍引用着这些 URB 和它们指向的 buffer，此时释放会变成
+	// 悬空指针。这里故意 release() 泄漏掉：进程马上退出，内核在 close(fd)
+	// 时会把它们清理干净。真正长期运行的程序应该继续重试收割。
+	if (pending > 0) {
+		for (auto &req : reqs) {
+			if (req.urb) {
+				std::println(stderr, "  放弃请求 #{} 的 URB（进程退出时随 fd 清理）",
+					req.id);
+				(void)req.urb.release();
+			}
+		}
+	}
 	return reaped;
 }
 
@@ -605,11 +618,15 @@ static void run_in(int fd, unsigned char endpoint)
 						static_cast<std::size_t>(std::min<int>(c.actual, 16))));
 
 			if (c.short_packet) {
-				// 短包 = 设备这次没把 buffer 填满。批量 IN 默认把它当成
-				// “这一轮数据结束”的正常信号（status 仍是 0）。如果提交时
-				// 设了 USBDEVFS_URB_SHORT_NOT_OK，这里会变成 -EREMOTEIO。
-				std::println("  短包（{} < {}）：批量 IN 默认视为正常收尾，"
-					"status=0", c.actual, c.cap);
+				// 短包 = 设备这次没把 buffer 填满。严格说，“短包”是指
+				// 最后收到的包不足 wMaxPacketSize；本程序不知道端点的
+				// wMaxPacketSize，只能用 actual < 容量 近似判断（刚好
+				// 收到整数个满包时也可能小于容量，属于误判）。
+				// 批量 IN 默认把短包当成“这一轮数据结束”的正常信号
+				// （status 仍是 0）。如果提交时设了
+				// USBDEVFS_URB_SHORT_NOT_OK，这里会变成 -EREMOTEIO。
+				std::println("  可能收到短包（{} < {}）：批量 IN 默认视为"
+					"正常收尾，status=0", c.actual, c.cap);
 				if (c.actual == 0)
 					std::println("  actual=0 即零长度包(ZLP)");
 				stop = true;

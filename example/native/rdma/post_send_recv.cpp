@@ -51,6 +51,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -345,10 +346,10 @@ int main()
 		attr.pkey_index = 0;	// 默认分区 0xffff
 		attr.port_num = kPort;
 		attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-						IBV_ACCESS_REMOTE_READ;
+			IBV_ACCESS_REMOTE_READ;
 
 		const int mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-					IBV_QP_ACCESS_FLAGS;
+			IBV_QP_ACCESS_FLAGS;
 		if (ibv_modify_qp(qp.get(), &attr, mask) != 0) {
 			std::fprintf(stderr, "modify_qp(INIT) 失败: %s\n",
 				std::strerror(errno));
@@ -360,7 +361,7 @@ int main()
 	//     dest_qp_num 是对端 QPN（loopback 时就是自己）；
 	//     rq_psn / sq_psn 是包序号起点，两端必须一致（这里都用 0）；
 	//     path_mtu 取端口当前 MTU；min_rnr_timer 是收到 RNR NAK 后至少等
-	//     多久（编码值 12 ≈ 0.64 ms，是常见默认）；
+	//     多久（编码值 12 ≈ 0.64 ms，是常见默认；编码表未核对）；
 	//     max_dest_rd_atomic 是本端允许对端同时发起的 RDMA READ/ATOMIC 数。
 	//     ah_attr 是“地址向量”：RoCE 必须用 GRH（is_global=1 + dgid），
 	//     IB 用 LID（is_global=0 + dlid）。
@@ -398,8 +399,8 @@ int main()
 		}
 
 		const int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-					IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-					IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+			IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+			IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 		if (ibv_modify_qp(qp.get(), &attr, mask) != 0) {
 			std::fprintf(stderr, "modify_qp(RTR) 失败: %s\n",
 				std::strerror(errno));
@@ -408,9 +409,9 @@ int main()
 	}
 
 	// (c) RTS（Ready To Send）：可以发数据了。
-	//     timeout 是 ACK 超时（编码值，14 ≈ 4.096s * 2^14？实际是按
-	//     4.096us * 2^timeout 的粒度，越大等越久）；
-	//     retry_cnt / rnr_retry 是重传次数，7 表示无限重试；
+	//     timeout 是 ACK 超时，编码含义为 4.096us × 2^timeout（14 ≈ 67ms，未核对），
+	//     超时未收到 ACK 就按 retry_cnt 重传；
+	//     rnr_retry 是收到 RNR NAK（对端没挂接收缓冲）时的重试次数，7 = 无限；
 	//     max_rd_atomic 是本端能同时在途的 RDMA READ/ATOMIC 数。
 	{
 		ibv_qp_attr attr{};
@@ -422,8 +423,8 @@ int main()
 		attr.max_rd_atomic = 1;
 
 		const int mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
-					IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-					IBV_QP_MAX_QP_RD_ATOMIC;
+			IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+			IBV_QP_MAX_QP_RD_ATOMIC;
 		if (ibv_modify_qp(qp.get(), &attr, mask) != 0) {
 			std::fprintf(stderr, "modify_qp(RTS) 失败: %s\n",
 				std::strerror(errno));
@@ -440,7 +441,6 @@ int main()
 	// -----------------------------------------------------------------
 	std::array<ibv_sge, kRecvCount> recv_sge{};
 	std::array<ibv_recv_wr, kRecvCount> recv_wr{};
-	std::array<int, kRecvCount> recv_slot{};
 
 	for (int i = 0; i < kRecvCount; ++i) {
 		const std::size_t off = kRecvArea + static_cast<std::size_t>(i) * kRecvSlot;
@@ -452,7 +452,6 @@ int main()
 		recv_wr[i].next = (i + 1 < kRecvCount) ? &recv_wr[i + 1] : nullptr;
 		recv_wr[i].sg_list = &recv_sge[i];
 		recv_wr[i].num_sge = 1;
-		recv_slot[i] = i;
 	}
 
 	ibv_recv_wr *bad_recv = nullptr;
@@ -531,13 +530,12 @@ int main()
 		// IBV_WC_RECV 是置了 bit7 的值，用 & 判断“这是不是接收完成”。
 		if (wcs[i].opcode & IBV_WC_RECV) {
 			++recv_done;
-			const std::size_t off =
-				kRecvArea + static_cast<std::size_t>(recv_slot[(wcs[i].wr_id - 100u)]) *
-						kRecvSlot;
+			// wr_id=100+i，反查回对应接收槽的下标。
+			const std::size_t slot = static_cast<std::size_t>(wcs[i].wr_id - 100u);
+			const std::size_t off = kRecvArea + slot * kRecvSlot;
 			// 接收缓冲不保证以 '\0' 结尾，用显式长度打印。
 			std::printf("        收到 %u 字节: \"%.*s\"\n", wcs[i].byte_len,
-					static_cast<int>(wcs[i].byte_len),
-					arena.data() + off);
+				static_cast<int>(wcs[i].byte_len), arena.data() + off);
 		}
 	}
 	if (got != total)
@@ -547,10 +545,13 @@ int main()
 	// 9. 演示 bad_wr
 	//
 	// QP 的 max_send_sge = 1。下面这条链第一项合法、第二项故意挂 2 个 SGE。
-	// 规范行为：第一项已经入队（会正常发出并产生完成项），第二项被拒绝，
-	// ibv_post_send 返回 EINVAL，bad_wr 指向第二项。
-	// 注意：也有厂商在用户态先整链校验再整体入队，那样第一项不会发出；
-	// 下面的轮询带超时，就是为了两种情况都能收场。
+	// ibv_post_send 的约定是：调用失败时返回 errno，并把 bad_wr 指向“第一个
+	// 被拒绝的 WR”；它之前的 WR 已经入队、会照常执行。所以这里第一项
+	// （wr_id=900）可能已经发出，第二项被拒。
+	// 注意：在哪一层校验取决于驱动——有的（mlx5 用户态）在 post 时就检查
+	// 并返回 EINVAL；有的（如 rxe，WQE 在用户态排队、由内核执行）会先把
+	// WR 收下，执行时才报错，表现为 CQE status=IBV_WC_LOC_QP_OP_ERR。
+	// 两种都是合法实现（具体哪种驱动对应哪种行为，未核对），下面都处理。
 	// -----------------------------------------------------------------
 	std::printf("\n--- bad_wr 演示：第 2 项 num_sge=2 超过 QP 的 max_send_sge=1 ---\n");
 
@@ -582,20 +583,20 @@ int main()
 	ibv_send_wr *rejected = nullptr;
 	const int rc_bad = ibv_post_send(qp.get(), &bad_chain[0], &rejected);
 	if (rc_bad == 0) {
-		std::fprintf(stderr, "意外：非法的 WR 链竟然提交成功了\n");
+		std::printf("post 阶段未拒绝（该驱动在执行时才校验），下面看 CQE 的错误状态\n");
 	} else {
 		const long idx = rejected ? static_cast<long>(rejected - bad_chain.data()) : -1;
 		std::printf("ibv_post_send 返回 %d（%s），bad_wr 指向第 %ld 项（wr_id=%s）\n",
-				rc_bad, std::strerror(rc_bad), idx,
-				(rejected && rejected->wr_id == 901) ? "901，符合预期" : "未知");
+			rc_bad, std::strerror(rc_bad), idx,
+			(rejected && rejected->wr_id == 901) ? "901，符合预期" : "未知");
 	}
 
-	// 第一项（wr_id=900）已被发出，配第 4 个 RECV（wr_id=103）。正常会收到
-	// 2 个 CQE；若驱动先整链校验，则一个都没有，靠超时结束。
+	// 第一项（wr_id=900）已发出，配的是第 4 个 RECV（wr_id=103）：正常会有
+	// 2 个 CQE（SEND + RECV）。若驱动先整链校验，则一个都没有，靠超时结束。
 	std::array<ibv_wc, 4> extra{};
 	const int got2 = poll_until(cq.get(), 2, extra, 300);
-	std::printf("bad_wr 演示后轮询到 %d 个完成项%s\n", got2,
-			got2 == 0 ? "（该驱动整链校验后才入队，属正常差异）" : "");
+	std::printf("bad_wr 演示后轮询到 %d 个完成项（0 个也可能：该驱动整链校验后才入队）\n",
+		got2);
 	for (int i = 0; i < got2; ++i)
 		print_wc(extra[i]);
 
