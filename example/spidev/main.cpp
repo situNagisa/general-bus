@@ -1,0 +1,52 @@
+#include <ibus/spidev.hpp>
+
+// spidev::message_link：communicate(pack...) 把静态 n 段放进同一次片选（SPI_IOC_MESSAGE(n)，n 是编译期常量）。
+//   send_pack / receive_pack / transceive_pack（全双工）；速率、cs_change 等每段属性用 set_xxx() 设置。
+// link 不持有 fd：设备由这里打开、关闭。
+// spidev::link 的 communicate：send_pack 是 write、receive_pack 是 read，每次一个独立片选。
+// 注意：SPI flash 读 ID 这类“先发命令、同一片选里再收”的事务，拆成两次会在中间释放片选，
+// 器件会丢弃命令；这里只演示调用方式。
+// 用法：./spidev [/dev/spidevB.C]
+
+#include <array>
+#include <cstdio>
+#include <exception>
+#include <span>
+#include <system_error>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+using namespace ibus;
+
+int main(int argc, char** argv) {
+	try {
+		char const* dev = argc > 1 ? argv[1] : "/dev/spidev0.0";
+		int fd = ::open(dev, O_RDWR | O_CLOEXEC);
+		if (fd < 0) throw std::system_error(errno, std::generic_category(), dev);
+		spidev::link l(fd);
+
+		std::array<std::byte, 1> cmd{std::byte{0x9F}};
+		std::array<std::byte, 3> id{};
+		auto w = communicate(l, send_pack(l, std::span<std::byte const>(cmd)));
+		auto n = communicate(l, receive_pack(l, std::span(id)));
+		std::printf("sent %zu, received %zu: %02x %02x %02x\n", w, n,
+			static_cast<unsigned>(id[0]), static_cast<unsigned>(id[1]), static_cast<unsigned>(id[2]));
+
+		// 静态 2 段同一次片选：读 SPI flash JEDEC ID（发 0x9F，接着收 3 字节），一次 SPI_IOC_MESSAGE(2)
+		spidev::message_link ml(fd);
+		std::size_t m = communicate(ml, send_pack(ml, std::span<std::byte const>(cmd)), receive_pack(ml, std::span(id)));
+		std::printf("message: %zu bytes, ID %02x %02x %02x\n", m,
+			static_cast<unsigned>(id[0]), static_cast<unsigned>(id[1]), static_cast<unsigned>(id[2]));
+
+		// 静态 3 段：命令 + 一段全双工 + 收，每段用 set_speed_hz 设的速率；transceive_pack 一段里同时发收
+		ml.set_speed_hz(1'000'000);
+		std::array<std::byte, 4> tx{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}}, rx{};
+		std::size_t k = communicate(ml, send_pack(ml, std::span<std::byte const>(cmd)),
+			transceive_pack(ml, std::span<std::byte const>(tx), std::span(rx)), receive_pack(ml, std::span(id)));
+		std::printf("message: %zu bytes\n", k);
+		::close(fd);
+	} catch (std::exception const& e) {
+		std::printf("error: %s\n", e.what());
+	}
+}
