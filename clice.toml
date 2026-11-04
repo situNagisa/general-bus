@@ -1,0 +1,3 @@
+[[rules]]
+patterns = ["**/*"]
+default_command = "clang++ -std=c++26 -Iinclude  -I${workspace}/include"
