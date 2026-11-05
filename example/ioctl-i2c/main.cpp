@@ -17,12 +17,12 @@
 int main(int argc, char** argv) {
 	using namespace ibus;
 	try {
-		// link 不持有 fd：打开设备、绑定从机地址都由这里做。
+		// port 不持有 fd：打开设备、绑定从机地址都由这里做。
 		char const* dev = argc > 1 ? argv[1] : "/dev/i2c-1";
 		int fd = ::open(dev, O_RDWR | O_CLOEXEC);
 		if (fd < 0) throw std::system_error(errno, std::generic_category(), dev);
 		if (::ioctl(fd, I2C_SLAVE, 0x50) < 0) throw std::system_error(errno, std::generic_category(), "ioctl(I2C_SLAVE)");
-		ioctl_i2c::link l(fd);
+		ioctl_i2c::port l{fd};
 		std::byte reg[1]{std::byte{0x10}}, data[16]{};
 
 		auto w = communicate(l, send_pack(l, std::span<std::byte const>(reg)));

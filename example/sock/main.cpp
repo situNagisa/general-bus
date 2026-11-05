@@ -1,21 +1,22 @@
 #include <ibus/sock.hpp>
 #include <nagisa/concurrency/semaphore.h>
 
-// sock 的各种 link；都是同步系统调用，communicate / communicate_range 直接返回结果。
-// link 不持有 fd：socket 由这里创建、配置、关闭。
-// sock::link：
+// sock 的各种 port；都是同步系统调用，communicate / communicate_range 直接返回结果。
+// port 不持有 fd：socket 由这里创建、配置、关闭。
+// sock::port：
 //   send_pack(span) / receive_pack(span)   1 段：send / recv
 //   send_pack(file_region)                 文件区间：sendfile
-//   writev_link / readv_link：communicate_range(iovec[])        动态 n 段合成 1 个单元
-//   sendmmsg_link / recvmmsg_link：communicate_range(mmsghdr[])  动态 n 个数据报
-//   sendmsg_link / recvmsg_link：sendmsg / recvmsg，set_gso_size 后走 UDP GSO，recv 交出 msg_flags 和 GRO 的 gso_size
-//   link 的 set_send_flags(MSG_ZEROCOPY)：零拷贝发送；errqueue_link：取错误队列里的“可复用”通知。
+//   writev_port / readv_port：communicate_range(iovec[])        动态 n 段合成 1 个单元
+//   sendmmsg_port / recvmmsg_port：communicate_range(mmsghdr[])  动态 n 个数据报
+//   sendmsg_port / recvmsg_port：sendmsg / recvmsg，send_pack 的 gso_size 参数走 UDP GSO，recv 交出 msg_flags 和 GRO 的 gso_size
+//   send_pack(span, MSG_ZEROCOPY)：零拷贝发送；errqueue_port：取错误队列里的“可复用”通知。
 //     buffer 由用户自己用 nagisa::concurrency::resource_pool 管理，序号由用户自己数。
-//   link + pipe_region：splice（pipe ↔ socket）
+//   port + pipe_region：splice（pipe ↔ socket）
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <map>
 #include <vector>
@@ -53,7 +54,7 @@ int main() {
 	try {
 		int sv[2];
 		::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
-		sock::link a(sv[0]), b(sv[1]);
+		sock::port a{sv[0]}, b{sv[1]};
 
 		// 1 段
 		char ping[] = "ping";
@@ -77,8 +78,8 @@ int main() {
 		{
 			int sv2[2];
 			::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv2);
-			sock::writev_link ia(sv2[0]);
-			sock::readv_link ib(sv2[1]);
+			sock::writev_port ia{sv2[0]};
+			sock::readv_port ib{sv2[1]};
 			char hdr[] = "HD", p0[] = "aaaa", p1[] = "bb";
 			std::vector<::iovec> tx{
 				send_pack(ia, std::as_bytes(std::span(hdr, 2))),
@@ -98,8 +99,8 @@ int main() {
 		{
 			int sv3[2];
 			::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv3);
-			sock::sendmmsg_link ma(sv3[0]);
-			sock::recvmmsg_link mb(sv3[1]);
+			sock::sendmmsg_port ma{sv3[0]};
+			sock::recvmmsg_port mb{sv3[1]};
 			char d0[] = "one", d1[] = "three", d2[] = "x";
 			std::array<::iovec, 3> tiov{{{d0, 3}, {d1, 5}, {d2, 1}}};
 			std::vector<::mmsghdr> tx;
@@ -115,17 +116,15 @@ int main() {
 			::close(sv3[1]);
 		}
 
-		// MSG_PEEK：set_receive_flags(MSG_PEEK)，看一眼不取走
+		// MSG_PEEK：receive_pack 的 flags 参数，看一眼不取走
 		{
 			int sp[2];
 			::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp);
-			sock::link pa(sp[0]), pb(sp[1]);
-			pb.set_receive_flags(MSG_PEEK);
+			sock::port pa{sp[0]}, pb{sp[1]};
 			char m[] = "peek";
 			std::array<std::byte, 4> r1{}, r2{};
 			communicate(pa, send_pack(pa, std::as_bytes(std::span(m, 4))));
-			communicate(pb, receive_pack(pb, std::span(r1)));
-			pb.set_receive_flags(0);
+			communicate(pb, receive_pack(pb, std::span(r1), MSG_PEEK));
 			communicate(pb, receive_pack(pb, std::span(r2)));
 			std::printf("peek \"%.4s\" then recv \"%.4s\"\n", reinterpret_cast<char*>(r1.data()), reinterpret_cast<char*>(r2.data()));
 			::close(sp[0]);
@@ -137,7 +136,7 @@ int main() {
 			int sp[2], pp[2];
 			::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sp);
 			::pipe2(pp, O_CLOEXEC);
-			sock::link sa(sp[0]), sb(sp[1]);
+			sock::port sa{sp[0]}, sb{sp[1]};
 			char m[] = "spliced";
 			std::array<std::byte, 7> r{};
 			communicate(sa, send_pack(sa, std::as_bytes(std::span(m, 7))));
@@ -162,34 +161,39 @@ int main() {
 			::connect(tx, reinterpret_cast<::sockaddr*>(&a), sizeof a);
 			int on = 1;
 			::setsockopt(rxs, IPPROTO_UDP, UDP_GRO, &on, sizeof on);
-			sock::sendmsg_link gs(tx);
-			gs.set_gso_size(1000);
-			sock::recvmsg_link gr(rxs);
+			sock::sendmsg_port gs{tx};
+			sock::recvmsg_port gr{rxs};
 			static std::array<std::byte, 3500> big{};
 			static std::array<std::byte, 65536> rbuf{};
-			std::printf("sendmsg gso %zu\n", communicate(gs, send_pack(gs, std::span<std::byte const>(big))));
+			alignas(::cmsghdr) std::array<std::byte, CMSG_SPACE(sizeof(int))> ctrl;
+			std::printf("sendmsg gso %zu\n", communicate(gs, send_pack(gs, std::span<std::byte const>(big), 0, 1000)));
 			std::size_t total = 0;
 			while (total < big.size()) {
-				auto r = communicate(gr, receive_pack(gr, std::span(rbuf)));
-				std::printf("recvmsg %zu bytes, gro_size=%u, flags=%#x\n", r.size, r.gro_size, r.flags);
+				auto r = communicate(gr, receive_pack(gr, std::span(rbuf), std::span(ctrl)));
+				// cmsg 由用户自己解析：UDP_GRO 给出每个原始包的大小
+				::msghdr m{};
+				m.msg_control = ctrl.data();
+				m.msg_controllen = r.control_size;
+				int gro = 0;
+				for (::cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+					if (c->cmsg_level == IPPROTO_UDP && c->cmsg_type == UDP_GRO) std::memcpy(&gro, CMSG_DATA(c), sizeof gro);
+				std::printf("recvmsg %zu bytes, gro_size=%d, flags=%#x\n", r.size, gro, r.flags);
 				total += r.size;
 			}
 			::close(tx);
 			::close(rxs);
 		}
 
-		// 零拷贝：link 不管发送内存。用户自己用 resource_pool 管两块 buffer：
+		// 零拷贝：port 不管发送内存。用户自己用 resource_pool 管两块 buffer：
 		// 借一块 → send_pack 发出（完成值是序号）→ 记住“序号 → permit”；
 		// 没有空闲块时，收一个“可复用”通知，把通知覆盖的序号对应的 permit 析构（还回池里）。
 		// 回环上内核要等对端读走数据才发通知，所以接收端同时在另一个线程读。
 		auto [c, s] = tcp_pair();
 		int one = 1;
 		::setsockopt(c, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof one);
-		// 零拷贝发送：普通 link，set_send_flags(MSG_ZEROCOPY)；通知从同一个 fd 的错误队列取（errqueue_link）。
-		sock::link zc(c);
-		zc.set_send_flags(MSG_ZEROCOPY);
-		sock::errqueue_link zq(c);
-		sock::link zs(s);
+		// 零拷贝发送：普通 port，send_pack(..., MSG_ZEROCOPY)；通知从同一个 fd 的错误队列取（errqueue_port）。
+		sock::port zc{c}, zs{s};
+		sock::errqueue_port zq{c};
 		std::jthread reader([&] {
 			static std::array<std::byte, 64 * 1024> sink;
 			std::size_t total = 0;
@@ -208,8 +212,8 @@ int main() {
 				// 错误队列的 recvmsg 不阻塞；等通知由用户自己 poll(POLLERR)。
 				::pollfd pf{.fd = c, .events = 0, .revents = 0};
 				::poll(&pf, 1, -1);
-				::sock_extended_err e;
-				communicate(zq, receive_pack(zq, e));
+				alignas(::cmsghdr) static std::array<std::byte, CMSG_SPACE(sizeof(::sock_extended_err))> ctrl;
+				auto const& e = *communicate(zq, receive_pack(zq, std::span(ctrl)));
 				if (e.ee_origin != SO_EE_ORIGIN_ZEROCOPY) throw std::system_error(static_cast<int>(e.ee_errno), std::generic_category(), "errqueue");
 				std::printf("  notification [%u, %u] copied=%d\n", e.ee_info, e.ee_data, (e.ee_code & SO_EE_CODE_ZEROCOPY_COPIED) != 0);
 				inflight.erase(inflight.lower_bound(e.ee_info), inflight.upper_bound(e.ee_data));  // permit 析构 = 还回池里
@@ -217,7 +221,7 @@ int main() {
 			}
 			auto buf = permit->token().first(1000);
 			std::ranges::fill(buf, std::byte('a' + i));
-			communicate(zc, send_pack(zc, buf));
+			communicate(zc, send_pack(zc, buf, MSG_ZEROCOPY));
 			std::printf("zerocopy send #%d seq=%u\n", i, seq);
 			inflight.emplace(seq++, std::move(*permit));
 		}

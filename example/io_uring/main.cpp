@@ -1,11 +1,13 @@
 #include <ibus/io_uring.hpp>
 
 // 先编排、再一次提交：io_uring，原生接口（不用 liburing）。
-//   sq_link：send_pack / receive_pack 在共享内存里的 SQE 上原地填写，返回 SQE 下标（槽位由这里分配）；
-//            communicate_range(下标) 写进 SQ 索引环、推进 tail，一次 io_uring_enter；
-//            set_sqe_flags(IOSQE_IO_LINK) 让它们按顺序执行。
-//   cq_link：communicate(receive_pack()) 等一个 CQE，返回 uring::cqe（析构时推进 CQ head）；靠 user_data 对应。
-// link 不持有资源：io_uring_setup、mmap、munmap、close 都由这里做。
+// 把 io_uring 当作协议：
+//   communicate(sq, send_pack(sq, uring::send / uring::receive, fd, buf, user_data[, sqe_flags, msg_flags]))
+//       取下一个 SQE 槽位原地填写（RECV 对内核来说也是“发”一个请求，所以也用 send_pack）；sqe_flags = IOSQE_IO_LINK 串成链
+//   communicate(sq, send_pack(sq, uring::submit, wait_nr))  发布 tail，一次 io_uring_enter，顺带等至少 wait_nr 个 CQE
+//   communicate(cq, receive_pack(cq))                    取下一个 CQE：指向共享内存，没有就是 nullptr；靠 user_data 对应
+//   communicate(cq, send_pack(cq, uring::release))       归还已取出的 CQE（发布 head）
+// port 不持有资源：io_uring_setup、mmap、munmap、close 都由这里做。
 
 #include <algorithm>
 #include <array>
@@ -35,32 +37,26 @@ int main() {
 		std::size_t sqes_size = p.sq_entries * sizeof(::io_uring_sqe);
 		void* sqes = ::mmap(nullptr, sqes_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, rfd, IORING_OFF_SQES);
 		if (sq == MAP_FAILED || cq == MAP_FAILED || sqes == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "mmap");
-		uring::ring ring = uring::ring::at(rfd, p, sq, cq, sqes);
+		uring::sq_port sqp = uring::sq_port::at(rfd, p, sq, sqes);
+		uring::cq_port cqp = uring::cq_port::at(p, cq);
 
 		int sv[2];
 		::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
-		uring::sq_link a(ring, sv[0]), b(ring, sv[1]);
-		uring::cq_link cqs(ring);
-
-		// a：发 ping、再收，用 IO_LINK 串成链（按顺序执行）。SQE 槽位 0、1
 		char ping[] = "ping", pong[] = "pong";
 		std::array<std::byte, 4> a_rx{}, b_rx{};
-		a.set_sqe_flags(IOSQE_IO_LINK);
-		std::array<std::uint32_t, 2> sa;
-		sa[0] = send_pack(a, 0, std::as_bytes(std::span(ping, 4)), 1);
-		a.set_sqe_flags(0);
-		sa[1] = receive_pack(a, 1, std::span(a_rx), 2);
-		std::printf("a submitted %zu\n", communicate_range(a, sa));
 
-		// b：先收、再回 pong，同一个 ring。非 SQPOLL 时上面提交返回后槽位 0、1 已可复用，这里仍用 2、3 便于对照
-		std::array<std::uint32_t, 2> sb{receive_pack(b, 2, std::span(b_rx), 3), send_pack(b, 3, std::as_bytes(std::span(pong, 4)), 4)};
-		std::printf("b submitted %zu\n", communicate_range(b, sb));
+		// a 端：发 ping、再收，IO_LINK 串成链（按顺序执行）；b 端：先收、再回 pong。四项一次提交，一个 ring 覆盖两个 fd
+		communicate(sqp, send_pack(sqp, uring::send, sv[0], std::as_bytes(std::span(ping, 4)), 1, IOSQE_IO_LINK));
+		communicate(sqp, send_pack(sqp, uring::receive, sv[0], std::span(a_rx), 2));
+		communicate(sqp, send_pack(sqp, uring::receive, sv[1], std::span(b_rx), 3));
+		communicate(sqp, send_pack(sqp, uring::send, sv[1], std::as_bytes(std::span(pong, 4)), 4));
+		// 一次 io_uring_enter：提交 4 项，并等到 4 个 CQE 都到
+		std::printf("submitted %zu\n", communicate(sqp, send_pack(sqp, uring::submit, 4)));
 
-		// 4 个 CQE，到达顺序不定，靠 user_data 区分
-		for (int i = 0; i < 4; ++i) {
-			auto c = communicate(cqs, receive_pack(cqs));
+		// 4 个 CQE，到达顺序不定，靠 user_data 区分；全部看完再一次归还
+		while (auto* c = communicate(cqp, receive_pack(cqp)))
 			std::printf("cqe user_data=%llu res=%d\n", static_cast<unsigned long long>(c->user_data), c->res);
-		}
+		communicate(cqp, send_pack(cqp, uring::release));
 		std::printf("a got %.4s, b got %.4s\n", reinterpret_cast<char*>(a_rx.data()), reinterpret_cast<char*>(b_rx.data()));
 
 		::close(sv[0]);

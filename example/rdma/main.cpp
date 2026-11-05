@@ -1,17 +1,16 @@
 #include <ibus/rdma.hpp>
 
 // 先编排、再一次提交：RDMA verbs。
-//   send_link：send_pack(SEND / RDMA WRITE) / receive_pack(RDMA READ) 返回 WR，communicate_range 串成链表一次 ibv_post_send
-//   recv_link：receive_pack 返回 recv WR，communicate_range 一次 ibv_post_recv
-//   cq_link：communicate(receive_pack(wc 数组)) 取完成项，靠 wr_id 区分
-// link 不持有资源：设备、PD、MR、CQ、QP（含 INIT→RTR→RTS 自连）都由这里建、销毁。
+//   send_port：send_pack(wr, SEND / RDMA WRITE / RDMA READ) 在用户的 WR 上原地填写并接到链表，send_pack(submit) 一次 ibv_post_send
+//   recv_port：send_pack(wr, region) 同上，send_pack(submit) 一次 ibv_post_recv
+//   cq_port：communicate(receive_pack(wc 数组)) 取完成项，靠 wr_id 区分
+// port 不持有资源：设备、PD、MR、CQ、QP（含 INIT→RTR→RTS 自连）都由这里建、销毁。
 // 本机没有 RDMA 设备时打印提示退出。完整建链流程见 example/native/rdma/post_send_recv.cpp。
 
 #include <array>
 #include <cstdio>
 #include <exception>
 #include <span>
-#include <vector>
 
 int main() {
 	using namespace ibus;
@@ -36,14 +35,18 @@ int main() {
 		static std::array<std::byte, 64> buf{};
 		::ibv_mr* mr = ::ibv_reg_mr(pd, buf.data(), buf.size(), IBV_ACCESS_LOCAL_WRITE);
 
-		rdma::recv_link rl(qp);
-		rdma::send_link sl(qp);
-		rdma::cq_link cq(cqh);
+		auto rl = rdma::recv_port::at(qp);
+		auto sl = rdma::send_port::at(qp);
+		rdma::cq_port cq{cqh};
 
-		std::vector<rdma::recv_link::recv_wr> rw{receive_pack(rl, rdma::region{std::span(buf).first(32), mr->lkey}, 1)};
-		communicate_range(rl, rw);
-		std::vector<rdma::send_link::send_wr> sw{send_pack(sl, rdma::const_region{std::span(buf).last(32), mr->lkey}, 2)};
-		communicate_range(sl, sw);
+		// WR 放在用户的内存里，原地填写、接成链表，submit 一次 post
+		rdma::recv_wr rw;
+		communicate(rl, send_pack(rl, rw, rdma::region{std::span(buf).first(32), mr->lkey}, 1));
+		communicate(rl, send_pack(rl, rdma::submit));
+		std::array<rdma::send_wr, 2> sw;
+		communicate(sl, send_pack(sl, sw[0], rdma::const_region{std::span(buf).last(32), mr->lkey}, 2));
+		communicate(sl, send_pack(sl, sw[1], rdma::const_region{std::span(buf).last(32), mr->lkey}, 3));
+		communicate(sl, send_pack(sl, rdma::submit));
 
 		std::array<::ibv_wc, 4> wc;
 		std::printf("polled %zu\n", communicate(cq, receive_pack(cq, std::span(wc))));

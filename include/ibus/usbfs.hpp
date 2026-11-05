@@ -15,12 +15,14 @@
 
 namespace ibus::usbfs {
 
-// link：一个 USB 设备的默认控制端点（已打开的 /dev/bus/usb/BBB/DDD，由用户打开、关闭）。
+// port：一个 USB 设备的默认控制端点（已打开的 /dev/bus/usb/BBB/DDD，由用户打开、关闭）。
 // USBDEVFS_CONTROL 是同步的，直接返回结果。
-class link {
-public:
+struct port {
+	int fd;
+
 	struct setup_packet {
 		::usb_ctrlrequest setup;
+		unsigned timeout_ms;  // 0：一直等
 	};
 	struct out_packet {
 		std::span<std::byte const> data;
@@ -29,53 +31,43 @@ public:
 		std::span<std::byte> data;
 	};
 
-	explicit link(int fd) noexcept : fd_(fd) {}
-
-	void set_timeout_ms(unsigned v) noexcept { cfg_.timeout_ms = v; }  // 0：一直等
-
-	setup_packet send_pack(::usb_ctrlrequest const& s) const noexcept { return {s}; }
+	setup_packet send_pack(::usb_ctrlrequest const& s, unsigned timeout_ms = 1000) const noexcept { return {s, timeout_ms}; }
 	out_packet send_pack(std::span<std::byte const> d) const noexcept { return {d}; }
 	in_packet receive_pack(std::span<std::byte> d) const noexcept { return {d}; }
 
 	// 控制传输，只有 setup 阶段。返回 0。
-	std::size_t communicate(setup_packet s) const { return control(s.setup, nullptr); }
+	std::size_t communicate(setup_packet s) const { return _control(s, nullptr); }
 
 	// 控制传输，setup + OUT 数据阶段。返回发出的字节数。
 	std::size_t communicate(setup_packet s, out_packet d) const {
 		assert((s.setup.bRequestType & USB_DIR_IN) == 0 && "usbfs: OUT data stage but bRequestType is IN");
 		assert(d.data.size() == le16toh(s.setup.wLength) && "usbfs: data length != wLength");
-		return control(s.setup, const_cast<std::byte*>(d.data.data()));
+		return _control(s, const_cast<std::byte*>(d.data.data()));
 	}
 
 	// 控制传输，setup + IN 数据阶段。返回收到的字节数。
 	std::size_t communicate(setup_packet s, in_packet d) const {
 		assert((s.setup.bRequestType & USB_DIR_IN) != 0 && "usbfs: IN data stage but bRequestType is OUT");
 		assert(d.data.size() == le16toh(s.setup.wLength) && "usbfs: data length != wLength");
-		return control(s.setup, d.data.data());
+		return _control(s, d.data.data());
 	}
 
 private:
-	struct config {
-		unsigned timeout_ms = 1000;  // 0：一直等
-	};
-
-	std::size_t control(::usb_ctrlrequest const& setup, void* data) const {
+	std::size_t _control(setup_packet const& s, void* data) const {
+		::usb_ctrlrequest const& setup = s.setup;
 		::usbdevfs_ctrltransfer c{
 			.bRequestType = setup.bRequestType,
 			.bRequest = setup.bRequest,
 			.wValue = le16toh(setup.wValue),
 			.wIndex = le16toh(setup.wIndex),
 			.wLength = le16toh(setup.wLength),
-			.timeout = cfg_.timeout_ms,
+			.timeout = s.timeout_ms,
 			.data = data,
 		};
-		int r = ::ioctl(fd_, USBDEVFS_CONTROL, &c);
+		int r = ::ioctl(fd, USBDEVFS_CONTROL, &c);
 		if (r < 0) throw std::system_error(errno, std::generic_category(), "ioctl(USBDEVFS_CONTROL)");
 		return static_cast<std::size_t>(r);
 	}
-
-	int fd_;
-	config cfg_;
 };
 
 }  // namespace ibus::usbfs

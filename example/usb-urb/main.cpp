@@ -1,8 +1,8 @@
 #include <ibus/usb_urb.hpp>
 
-// usb_urb::link：异步 bulk / interrupt URB。communicate 返回 sender：start 时 USBDEVFS_SUBMITURB 提交，
+// usb_urb::port：异步 bulk / interrupt URB。communicate 返回 sender：start 时 USBDEVFS_SUBMITURB 提交，
 // 完成要靠 reaper 收割（USBDEVFS_REAPURB），reaper 放到哪个线程跑由用户定——这里放在一个 jthread 里。
-// link 不持有 fd：打开设备、CLAIMINTERFACE 都由这里做。
+// port 不持有 fd：打开设备、CLAIMINTERFACE 都由这里做。
 // 用法：./usb-urb /dev/bus/usb/BBB/DDD 接口号 IN端点（如 0x81）
 
 #include <array>
@@ -30,8 +30,8 @@ int main(int argc, char** argv) {
 		if (::ioctl(fd, USBDEVFS_CLAIMINTERFACE, &ifc) < 0) throw std::system_error(errno, std::generic_category(), "CLAIMINTERFACE");
 		auto ep = static_cast<unsigned char>(std::strtoul(argv[3], nullptr, 0));
 
-		usb_urb::link in(fd, USBDEVFS_URB_TYPE_BULK, ep);
-		usb_urb::reaper reaper(fd);
+		usb_urb::port in{fd, USBDEVFS_URB_TYPE_BULK, ep};
+		usb_urb::reaper reaper{fd};
 		std::jthread reaping([&] { reaper.run_one(); });  // 收割 1 个 URB
 
 		std::array<std::byte, 512> buf{};

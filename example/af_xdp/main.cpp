@@ -1,9 +1,11 @@
 #include <ibus/af_xdp.hpp>
 
 // 先编排、再一次提交：AF_XDP 的四个共享环。
-//   fill_link：把空闲 UMEM 块借给内核（接收用）；rx_link：取收到的包（UMEM 偏移 + 长度）
-//   tx_link：send_pack 返回 xdp_desc，communicate_range 写进 TX 环 + sendto 唤醒；completion_link：取发完可复用的块
-// link 不持有资源：socket、UMEM 注册、环的 setsockopt / mmap、bind 都由这里做。需要 root。
+// 当作协议直接读写环：communicate(send_pack(desc)) 写进下一个槽位，communicate(send_pack(af_xdp::publish)) 发布；
+// communicate(receive_pack()) 取下一个描述（指向环里，没有是 nullptr），communicate(send_pack(af_xdp::publish)) 归还。
+//   fill_port：把空闲 UMEM 块借给内核（接收用）；rx_port：取收到的包（UMEM 偏移 + 长度）
+//   tx_port：写 TX 环，发布时 sendto 唤醒内核；completion_port：取发完可复用的块
+// port 不持有资源：socket、UMEM 注册、环的 setsockopt / mmap、bind 都由这里做。需要 root。
 // 用法：sudo ./af_xdp [网卡名，默认 lo]
 
 #include <array>
@@ -55,28 +57,29 @@ int main(int argc, char** argv) {
 		sa.sxdp_flags = XDP_COPY;
 		if (::bind(xsk, reinterpret_cast<::sockaddr*>(&sa), sizeof sa) < 0) throw std::system_error(errno, std::generic_category(), "bind(AF_XDP)");
 
-		af_xdp::fill_link fill(af_xdp::ring<std::uint64_t>::at(fill_m, off.fr, ring_size));
-		af_xdp::tx_link tx(xsk, af_xdp::ring<::xdp_desc>::at(tx_m, off.tx, ring_size));
-		af_xdp::completion_link comp(af_xdp::ring<std::uint64_t>::at(comp_m, off.cr, ring_size));
-		af_xdp::rx_link rx(af_xdp::ring<::xdp_desc>::at(rx_m, off.rx, ring_size));
+		auto fill = af_xdp::fill_port::at(fill_m, off.fr, ring_size);
+		af_xdp::tx_port tx{af_xdp::producer_port<::xdp_desc>::at(tx_m, off.tx, ring_size), xsk};
+		auto comp = af_xdp::completion_port::at(comp_m, off.cr, ring_size);
+		auto rx = af_xdp::rx_port::at(rx_m, off.rx, ring_size);
 
 		// 前一半块借给内核接收
-		std::array<std::uint64_t, frames / 2> fa;
-		for (std::uint32_t i = 0; i < fa.size(); ++i) fa[i] = send_pack(fill, i * frame_size);
-		communicate_range(fill, fa);
+		for (std::uint32_t i = 0; i < frames / 2; ++i) communicate(fill, send_pack(fill, std::uint64_t{i * frame_size}));
+		communicate(fill, send_pack(fill, af_xdp::publish));
 
 		// 后一半块用来发：写一个 64 字节的帧（内容不重要，lo 上 XDP_COPY 模式能发出）
 		std::uint64_t at = (frames / 2) * frame_size;
 		std::memset(static_cast<std::byte*>(umem) + at, 0xff, 64);
-		std::array<::xdp_desc, 1> td{send_pack(tx, at, 64)};
-		communicate_range(tx, td);
+		communicate(tx, send_pack(tx, ::xdp_desc{at, 64, 0}));
+		communicate(tx, send_pack(tx, af_xdp::publish));
 
-		std::array<std::uint64_t, 4> done{};
-		std::size_t k = 0;
-		for (int i = 0; i < 1000 && k == 0; ++i) k = communicate(comp, receive_pack(comp, std::span(done)));
-		std::printf("tx completed %zu frame(s)\n", k);
-		std::array<::xdp_desc, 4> got{};
-		std::printf("rx got %zu frame(s)（需要 XDP 程序把包重定向到这个 socket，这里没有加载）\n", communicate(rx, receive_pack(rx, std::span(got))));
+		// completion 环：内核发完会把块的偏移放回来（XDP_COPY 下 sendto 返回时通常已经完成）
+		if (auto* done = communicate(comp, receive_pack(comp))) {
+			std::printf("tx completed: umem offset %llu\n", static_cast<unsigned long long>(*done));
+			communicate(comp, send_pack(comp, af_xdp::publish));
+		} else {
+			std::printf("tx not completed yet\n");
+		}
+		std::printf("rx got a frame: %s（需要 XDP 程序把包重定向到这个 socket，这里没有加载）\n", communicate(rx, receive_pack(rx)) ? "yes" : "no");
 		::close(xsk);
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());
