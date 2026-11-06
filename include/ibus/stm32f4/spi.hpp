@@ -103,7 +103,12 @@ struct dma_port {
 private:
 	// exec::create 的 fn：存在 op state 里，地址固定到完成，所以直接把自己登记进 completion。
 	struct _start {
-		dma_port port;
+		SPI_TypeDef* spi;
+		DMA_Stream_TypeDef* rx_stream;
+		DMA_Stream_TypeDef* tx_stream;
+		std::uint32_t rx_cr;
+		std::uint32_t tx_cr;
+		completion* done;
 		packet p;
 		void* ctx;
 		std::byte dummy;  // tx 为空时发的 0 / rx 为空时的丢弃字节
@@ -111,27 +116,27 @@ private:
 		template <class Ctx>
 		void operator()(Ctx& c) noexcept {
 			ctx = &c;
-			*port.done = {&_done<Ctx>, this};
+			*done = {&_done<Ctx>, this};
 			dummy = std::byte{0};
-			DMA_Stream_TypeDef* rx = port.rx_stream;
-			DMA_Stream_TypeDef* tx = port.tx_stream;
-			rx->PAR = reinterpret_cast<std::uint32_t>(&port.spi->DR);
+			DMA_Stream_TypeDef* rx = rx_stream;
+			DMA_Stream_TypeDef* tx = tx_stream;
+			rx->PAR = reinterpret_cast<std::uint32_t>(&spi->DR);
 			rx->M0AR = reinterpret_cast<std::uint32_t>(p.rx ? p.rx : &dummy);
 			rx->NDTR = p.size;
-			rx->CR = port.rx_cr | (p.rx ? DMA_SxCR_MINC : 0u) | DMA_SxCR_TCIE | DMA_SxCR_TEIE | DMA_SxCR_DMEIE;
-			tx->PAR = reinterpret_cast<std::uint32_t>(&port.spi->DR);
+			rx->CR = rx_cr | (p.rx ? DMA_SxCR_MINC : 0u) | DMA_SxCR_TCIE | DMA_SxCR_TEIE | DMA_SxCR_DMEIE;
+			tx->PAR = reinterpret_cast<std::uint32_t>(&spi->DR);
 			tx->M0AR = reinterpret_cast<std::uint32_t>(p.tx ? p.tx : &dummy);
 			tx->NDTR = p.size;
-			tx->CR = port.tx_cr | (p.tx ? DMA_SxCR_MINC : 0u) | DMA_SxCR_DIR_0;
+			tx->CR = tx_cr | (p.tx ? DMA_SxCR_MINC : 0u) | DMA_SxCR_DIR_0;
 			rx->CR |= DMA_SxCR_EN;
 			tx->CR |= DMA_SxCR_EN;
-			port.spi->CR2 |= SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN;
+			spi->CR2 |= SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN;
 		}
 
 		template <class Ctx>
 		static void _done(void* s, std::uint32_t flags) noexcept {
 			auto* self = static_cast<_start*>(s);
-			self->port.spi->CR2 &= ~(SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
+			self->spi->CR2 &= ~(SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
 			auto& c = *static_cast<Ctx*>(self->ctx);
 			if (flags & (teif | dmeif)) return stdexec::set_error(std::move(c.receiver), flags);
 			stdexec::set_value(std::move(c.receiver));
@@ -140,7 +145,7 @@ private:
 
 public:
 	auto communicate(packet p) const noexcept {
-		return exec::create<stdexec::set_value_t(), stdexec::set_error_t(std::uint32_t)>(_start{*this, p, nullptr, {}});
+		return exec::create<stdexec::set_value_t(), stdexec::set_error_t(std::uint32_t)>(_start{spi, rx_stream, tx_stream, rx_cr, tx_cr, done, p, nullptr, {}});
 	}
 };
 

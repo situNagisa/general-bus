@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
+using namespace ibus;
 namespace spi = ibus::stm32f4::spi;
 
 // 每个外设一个登记处，中断里用它找到在途的传输。

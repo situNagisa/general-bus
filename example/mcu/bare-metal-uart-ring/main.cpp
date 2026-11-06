@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 
+using namespace ibus;
 namespace uart = ibus::stm32f4::uart;
 
 alignas(4) static std::array<std::byte, 256> ring{};

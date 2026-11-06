@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 
+using namespace ibus;
 namespace spi = ibus::stm32f4::spi;
 
 static spi::completion spi2_done;

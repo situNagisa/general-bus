@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 
+using namespace ibus;
 namespace spi = ibus::stm32f4::spi;
 
 // 只接 set_value() 的 receiver：轮询的 port 不会失败，没有错误通道。
