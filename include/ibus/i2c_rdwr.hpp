@@ -1,13 +1,12 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <ranges>
 #include <span>
-#include <system_error>
 
 #include <linux/i2c-dev.h>
 #include <linux/i2c.h>
@@ -15,7 +14,7 @@
 
 namespace ibus::i2c_rdwr {
 
-// port：已打开的 /dev/i2c-N（由用户打开、关闭），走 ioctl(I2C_RDWR)。同步，直接返回结果。
+// port：已打开的 /dev/i2c-N（由用户打开、关闭），走 ioctl(I2C_RDWR)。返回 sender：start 时一次 ioctl，失败 set_error(errno)。
 // send_pack / receive_pack 直接返回 i2c_msg；从机地址和每条消息的 flags 是它们的参数，同一个事务里可以访问多个从机。
 // 用户把任意多个放进一段连续内存，communicate_range 一次交给 I2C_RDWR：相邻消息之间 repeated START，最后 STOP。
 // flags：I2C_M_TEN 10 位地址；I2C_M_NOSTART 不发 START 和地址，接在上一条后面（需 I2C_FUNC_NOSTART）；
@@ -30,14 +29,11 @@ struct port {
 	}
 
 	// 动态 n 条：一段连续的 i2c_msg，原地交给一次 I2C_RDWR。返回完成的条数。
-	std::size_t communicate_range(auto&& msgs) const {
-		::i2c_rdwr_ioctl_data d{
-			.msgs = std::ranges::data(msgs),
-			.nmsgs = static_cast<std::uint32_t>(std::ranges::size(msgs)),
-		};
-		int n = ::ioctl(fd, I2C_RDWR, &d);
-		if (n < 0) throw std::system_error(errno, std::generic_category(), "ioctl(I2C_RDWR)");
-		return static_cast<std::size_t>(n);
+	auto communicate_range(auto&& msgs) const noexcept {
+		return detail::syscall<std::size_t>([fd = fd, m = std::ranges::data(msgs), n = static_cast<std::uint32_t>(std::ranges::size(msgs))] noexcept {
+			::i2c_rdwr_ioctl_data d{.msgs = m, .nmsgs = n};
+			return ::ioctl(fd, I2C_RDWR, &d);
+		});
 	}
 
 private:

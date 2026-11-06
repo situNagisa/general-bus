@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <exception>
 #include <span>
 #include <system_error>
@@ -20,6 +21,9 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main() {
 	using namespace ibus;
@@ -46,17 +50,17 @@ int main() {
 		std::array<std::byte, 4> a_rx{}, b_rx{};
 
 		// a 端：发 ping、再收，IO_LINK 串成链（按顺序执行）；b 端：先收、再回 pong。四项一次提交，一个 ring 覆盖两个 fd
-		communicate(sqp, send_pack(sqp, uring::send, sv[0], std::as_bytes(std::span(ping, 4)), 1, IOSQE_IO_LINK));
-		communicate(sqp, send_pack(sqp, uring::receive, sv[0], std::span(a_rx), 2));
-		communicate(sqp, send_pack(sqp, uring::receive, sv[1], std::span(b_rx), 3));
-		communicate(sqp, send_pack(sqp, uring::send, sv[1], std::as_bytes(std::span(pong, 4)), 4));
+		stdexec::sync_wait(communicate(sqp, send_pack(sqp, uring::send, sv[0], std::as_bytes(std::span(ping, 4)), 1, IOSQE_IO_LINK)));
+		stdexec::sync_wait(communicate(sqp, send_pack(sqp, uring::receive, sv[0], std::span(a_rx), 2)));
+		stdexec::sync_wait(communicate(sqp, send_pack(sqp, uring::receive, sv[1], std::span(b_rx), 3)));
+		stdexec::sync_wait(communicate(sqp, send_pack(sqp, uring::send, sv[1], std::as_bytes(std::span(pong, 4)), 4)));
 		// 一次 io_uring_enter：提交 4 项，并等到 4 个 CQE 都到
-		std::printf("submitted %zu\n", communicate(sqp, send_pack(sqp, uring::submit, 4)));
+		std::printf("submitted %zu\n", value(communicate(sqp, send_pack(sqp, uring::submit, 4))));
 
 		// 4 个 CQE，到达顺序不定，靠 user_data 区分；全部看完再一次归还
-		while (auto* c = communicate(cqp, receive_pack(cqp)))
+		while (auto* c = value(communicate(cqp, receive_pack(cqp))))
 			std::printf("cqe user_data=%llu res=%d\n", static_cast<unsigned long long>(c->user_data), c->res);
-		communicate(cqp, send_pack(cqp, uring::release));
+		stdexec::sync_wait(communicate(cqp, send_pack(cqp, uring::release)));
 		std::printf("a got %.4s, b got %.4s\n", reinterpret_cast<char*>(a_rx.data()), reinterpret_cast<char*>(b_rx.data()));
 
 		::close(sv[0]);

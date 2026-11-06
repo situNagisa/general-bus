@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <exception>
 #include <span>
 #include <system_error>
@@ -18,6 +19,9 @@
 #include <unistd.h>
 
 using namespace ibus;
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
 	try {
@@ -28,22 +32,26 @@ int main(int argc, char** argv) {
 
 		std::array<std::byte, 1> cmd{std::byte{0x9F}};
 		std::array<std::byte, 3> id{};
-		auto w = communicate(l, send_pack(l, std::span<std::byte const>(cmd)));
-		auto n = communicate(l, receive_pack(l, std::span(id)));
+		auto w = value(communicate(l, send_pack(l, std::span<std::byte const>(cmd))));
+		auto n = value(communicate(l, receive_pack(l, std::span(id))));
 		std::printf("sent %zu, received %zu: %02x %02x %02x\n", w, n,
 			static_cast<unsigned>(id[0]), static_cast<unsigned>(id[1]), static_cast<unsigned>(id[2]));
 
 		// 静态 2 段同一次片选：读 SPI flash JEDEC ID（发 0x9F，接着收 3 字节），一次 SPI_IOC_MESSAGE(2)
 		spidev::message_port ml{fd};
-		std::size_t m = communicate(ml, send_pack(ml, std::span<std::byte const>(cmd)), receive_pack(ml, std::span(id)));
+		std::size_t m = value(communicate(ml, send_pack(ml, std::span<std::byte const>(cmd)), receive_pack(ml, std::span(id))));
 		std::printf("message: %zu bytes, ID %02x %02x %02x\n", m,
 			static_cast<unsigned>(id[0]), static_cast<unsigned>(id[1]), static_cast<unsigned>(id[2]));
 
 		// 静态 3 段：命令 + 一段全双工 + 收，每段的速率是 pack 的参数，可以各不相同；transceive_pack 一段里同时发收
 		std::array<std::byte, 4> tx{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}}, rx{};
-		std::size_t k = communicate(ml, send_pack(ml, std::span<std::byte const>(cmd), 1'000'000),
-			transceive_pack(ml, std::span<std::byte const>(tx), std::span(rx), 20'000'000), receive_pack(ml, std::span(id), 1'000'000));
+		std::size_t k = value(communicate(ml, send_pack(ml, std::span<std::byte const>(cmd), 1'000'000),
+			transceive_pack(ml, std::span<std::byte const>(tx), std::span(rx), 20'000'000), receive_pack(ml, std::span(id), 1'000'000)));
 		std::printf("message: %zu bytes\n", k);
+
+		// 不拷贝的写法：段直接放在自己的数组里，communicate_range(span<spi_ioc_transfer, N>)，N 在编译期确定
+		std::array<::spi_ioc_transfer, 2> seg{send_pack(ml, std::span<std::byte const>(cmd)), receive_pack(ml, std::span(id))};
+		std::printf("message range: %zu bytes\n", value(communicate_range(ml, std::span(seg))));
 		::close(fd);
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());

@@ -1,7 +1,7 @@
 #include <ibus/sock.hpp>
 #include <nagisa/concurrency/semaphore.h>
 
-// sock 的各种 port；都是同步系统调用，communicate / communicate_range 直接返回结果。
+// sock 的各种 port；都是同步系统调用，communicate / communicate_range 返回 sender，这里用 sync_wait 取结果。
 // port 不持有 fd：socket 由这里创建、配置、关闭。
 // sock::port：
 //   send_pack(span) / receive_pack(span)   1 段：send / recv
@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <cstring>
 #include <exception>
 #include <map>
@@ -50,6 +51,9 @@ static std::array<int, 2> tcp_pair() {
 	return {c, s};
 }
 
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
+
 int main() {
 	try {
 		int sv[2];
@@ -59,8 +63,8 @@ int main() {
 		// 1 段
 		char ping[] = "ping";
 		std::array<std::byte, 4> rx{};
-		std::printf("send   %zu\n", communicate(a, send_pack(a, std::as_bytes(std::span(ping, 4)))));
-		std::printf("recv   %zu \"%.4s\"\n", communicate(b, receive_pack(b, std::span(rx))), reinterpret_cast<char*>(rx.data()));
+		std::printf("send   %zu\n", value(communicate(a, send_pack(a, std::as_bytes(std::span(ping, 4))))));
+		std::printf("recv   %zu \"%.4s\"\n", value(communicate(b, receive_pack(b, std::span(rx)))), reinterpret_cast<char*>(rx.data()));
 
 		// 文件区间：sendfile
 		char path[] = "/tmp/ibus_sock_XXXXXX";
@@ -68,8 +72,8 @@ int main() {
 		::write(f, "file-data", 9);
 		::unlink(path);
 		std::array<std::byte, 9> rf{};
-		std::printf("sendfile %zu\n", communicate(a, send_pack(a, sock::file_region{f, 0, 9})));
-		std::printf("recv   %zu \"%.9s\"\n", communicate(b, receive_pack(b, std::span(rf))), reinterpret_cast<char*>(rf.data()));
+		std::printf("sendfile %zu\n", value(communicate(a, send_pack(a, sock::file_region{f, 0, 9}))));
+		std::printf("recv   %zu \"%.9s\"\n", value(communicate(b, receive_pack(b, std::span(rf)))), reinterpret_cast<char*>(rf.data()));
 		::close(f);
 		::close(sv[0]);
 		::close(sv[1]);
@@ -89,8 +93,8 @@ int main() {
 			std::array<std::byte, 2> rh{};
 			std::array<std::byte, 6> rp{};
 			std::vector<::iovec> rx2{receive_pack(ib, std::span(rh)), receive_pack(ib, std::span(rp))};
-			std::printf("writev %zu\n", communicate_range(ia, tx));
-			std::printf("readv  %zu \"%.2s\"+\"%.6s\"\n", communicate_range(ib, rx2), reinterpret_cast<char*>(rh.data()), reinterpret_cast<char*>(rp.data()));
+			std::printf("writev %zu\n", value(communicate_range(ia, tx)));
+			std::printf("readv  %zu \"%.2s\"+\"%.6s\"\n", value(communicate_range(ib, rx2)), reinterpret_cast<char*>(rh.data()), reinterpret_cast<char*>(rp.data()));
 			::close(sv2[0]);
 			::close(sv2[1]);
 		}
@@ -109,8 +113,8 @@ int main() {
 			std::array<::iovec, 3> riov{{{rbuf[0].data(), 8}, {rbuf[1].data(), 8}, {rbuf[2].data(), 8}}};
 			std::vector<::mmsghdr> rx3;
 			for (auto& v : riov) rx3.push_back(receive_pack(mb, std::span(&v, 1)));
-			std::printf("sendmmsg %zu\n", communicate_range(ma, tx));
-			std::size_t k = communicate_range(mb, rx3);
+			std::printf("sendmmsg %zu\n", value(communicate_range(ma, tx)));
+			std::size_t k = value(communicate_range(mb, rx3));
 			for (std::size_t i = 0; i < k; ++i) std::printf("recvmmsg #%zu %u \"%.*s\"\n", i, rx3[i].msg_len, static_cast<int>(rx3[i].msg_len), rbuf[i].data());
 			::close(sv3[0]);
 			::close(sv3[1]);
@@ -123,9 +127,9 @@ int main() {
 			sock::port pa{sp[0]}, pb{sp[1]};
 			char m[] = "peek";
 			std::array<std::byte, 4> r1{}, r2{};
-			communicate(pa, send_pack(pa, std::as_bytes(std::span(m, 4))));
-			communicate(pb, receive_pack(pb, std::span(r1), MSG_PEEK));
-			communicate(pb, receive_pack(pb, std::span(r2)));
+			stdexec::sync_wait(communicate(pa, send_pack(pa, std::as_bytes(std::span(m, 4)))));
+			stdexec::sync_wait(communicate(pb, receive_pack(pb, std::span(r1), MSG_PEEK)));
+			stdexec::sync_wait(communicate(pb, receive_pack(pb, std::span(r2))));
 			std::printf("peek \"%.4s\" then recv \"%.4s\"\n", reinterpret_cast<char*>(r1.data()), reinterpret_cast<char*>(r2.data()));
 			::close(sp[0]);
 			::close(sp[1]);
@@ -139,10 +143,10 @@ int main() {
 			sock::port sa{sp[0]}, sb{sp[1]};
 			char m[] = "spliced";
 			std::array<std::byte, 7> r{};
-			communicate(sa, send_pack(sa, std::as_bytes(std::span(m, 7))));
-			std::printf("splice in  %zu\n", communicate(sb, receive_pack(sb, sock::pipe_region{pp[1], 7})));
-			std::printf("splice out %zu\n", communicate(sb, send_pack(sb, sock::pipe_region{pp[0], 7})));
-			communicate(sa, receive_pack(sa, std::span(r)));
+			stdexec::sync_wait(communicate(sa, send_pack(sa, std::as_bytes(std::span(m, 7)))));
+			std::printf("splice in  %zu\n", value(communicate(sb, receive_pack(sb, sock::pipe_region{pp[1], 7}))));
+			std::printf("splice out %zu\n", value(communicate(sb, send_pack(sb, sock::pipe_region{pp[0], 7}))));
+			stdexec::sync_wait(communicate(sa, receive_pack(sa, std::span(r))));
 			std::printf("recv \"%.7s\"\n", reinterpret_cast<char*>(r.data()));
 			::close(sp[0]);
 			::close(sp[1]);
@@ -166,10 +170,10 @@ int main() {
 			static std::array<std::byte, 3500> big{};
 			static std::array<std::byte, 65536> rbuf{};
 			alignas(::cmsghdr) std::array<std::byte, CMSG_SPACE(sizeof(int))> ctrl;
-			std::printf("sendmsg gso %zu\n", communicate(gs, send_pack(gs, std::span<std::byte const>(big), 0, 1000)));
+			std::printf("sendmsg gso %zu\n", value(communicate(gs, send_pack(gs, std::span<std::byte const>(big), 0, 1000))));
 			std::size_t total = 0;
 			while (total < big.size()) {
-				auto r = communicate(gr, receive_pack(gr, std::span(rbuf), std::span(ctrl)));
+				auto r = value(communicate(gr, receive_pack(gr, std::span(rbuf), std::span(ctrl))));
 				// cmsg 由用户自己解析：UDP_GRO 给出每个原始包的大小
 				::msghdr m{};
 				m.msg_control = ctrl.data();
@@ -197,7 +201,7 @@ int main() {
 		std::jthread reader([&] {
 			static std::array<std::byte, 64 * 1024> sink;
 			std::size_t total = 0;
-			while (total < 6 * 1000) total += communicate(zs, receive_pack(zs, std::span(sink)));
+			while (total < 6 * 1000) total += value(communicate(zs, receive_pack(zs, std::span(sink))));
 		});
 
 		static std::array<std::array<std::byte, 64 * 1024>, 2> blocks;
@@ -213,7 +217,7 @@ int main() {
 				::pollfd pf{.fd = c, .events = 0, .revents = 0};
 				::poll(&pf, 1, -1);
 				alignas(::cmsghdr) static std::array<std::byte, CMSG_SPACE(sizeof(::sock_extended_err))> ctrl;
-				auto const& e = *communicate(zq, receive_pack(zq, std::span(ctrl)));
+				auto const& e = *value(communicate(zq, receive_pack(zq, std::span(ctrl))));
 				if (e.ee_origin != SO_EE_ORIGIN_ZEROCOPY) throw std::system_error(static_cast<int>(e.ee_errno), std::generic_category(), "errqueue");
 				std::printf("  notification [%u, %u] copied=%d\n", e.ee_info, e.ee_data, (e.ee_code & SO_EE_CODE_ZEROCOPY_COPIED) != 0);
 				inflight.erase(inflight.lower_bound(e.ee_info), inflight.upper_bound(e.ee_data));  // permit 析构 = 还回池里
@@ -221,7 +225,7 @@ int main() {
 			}
 			auto buf = permit->token().first(1000);
 			std::ranges::fill(buf, std::byte('a' + i));
-			communicate(zc, send_pack(zc, buf, MSG_ZEROCOPY));
+			stdexec::sync_wait(communicate(zc, send_pack(zc, buf, MSG_ZEROCOPY)));
 			std::printf("zerocopy send #%d seq=%u\n", i, seq);
 			inflight.emplace(seq++, std::move(*permit));
 		}

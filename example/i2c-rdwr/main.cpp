@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <cstdlib>
 #include <exception>
 #include <span>
@@ -14,6 +15,9 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
 	using namespace ibus;
@@ -35,7 +39,7 @@ int main(int argc, char** argv) {
 			msgs[count++] = send_pack(l, addr, std::span<std::byte const>(&regs[i], 1));
 			msgs[count++] = receive_pack(l, addr, std::span<std::byte>(&vals[i], 1));
 		}
-		auto m = communicate_range(l, std::span(msgs).first(count));
+		auto m = value(communicate_range(l, std::span(msgs).first(count)));
 		std::printf("%zu of %zu msgs\n", m, count);
 
 		// 每条消息的从机地址、附加 flags 都是 pack 的参数：例如写寄存器地址和写数据用 I2C_M_NOSTART 拼成线上一次写
@@ -43,7 +47,7 @@ int main(int argc, char** argv) {
 		std::array<::i2c_msg, 2> w;
 		w[0] = send_pack(l, addr, std::span<std::byte const>(reg));
 		w[1] = send_pack(l, addr, std::span<std::byte const>(data), I2C_M_NOSTART);
-		std::printf("nostart: %zu msgs\n", communicate_range(l, w));
+		std::printf("nostart: %zu msgs\n", value(communicate_range(l, w)));
 		::close(fd);
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());

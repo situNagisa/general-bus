@@ -5,6 +5,7 @@
 // 用法：./ioctl-i2c [/dev/i2c-N]
 
 #include <cstdio>
+#include <tuple>
 #include <exception>
 #include <span>
 #include <system_error>
@@ -13,6 +14,9 @@
 #include <linux/i2c-dev.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
 	using namespace ibus;
@@ -25,8 +29,8 @@ int main(int argc, char** argv) {
 		ioctl_i2c::port l{fd};
 		std::byte reg[1]{std::byte{0x10}}, data[16]{};
 
-		auto w = communicate(l, send_pack(l, std::span<std::byte const>(reg)));
-		auto n = communicate(l, receive_pack(l, std::span(data)));
+		auto w = value(communicate(l, send_pack(l, std::span<std::byte const>(reg))));
+		auto n = value(communicate(l, receive_pack(l, std::span(data))));
 		std::printf("wrote %zu, read %zu bytes\n", w, n);
 		::close(fd);
 	} catch (std::exception const& e) {

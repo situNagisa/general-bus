@@ -9,8 +9,12 @@
 
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <exception>
 #include <span>
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main() {
 	using namespace ibus;
@@ -41,15 +45,15 @@ int main() {
 
 		// WR 放在用户的内存里，原地填写、接成链表，submit 一次 post
 		rdma::recv_wr rw;
-		communicate(rl, send_pack(rl, rw, rdma::region{std::span(buf).first(32), mr->lkey}, 1));
-		communicate(rl, send_pack(rl, rdma::submit));
+		stdexec::sync_wait(communicate(rl, send_pack(rl, rw, rdma::region{std::span(buf).first(32), mr->lkey}, 1)));
+		stdexec::sync_wait(communicate(rl, send_pack(rl, rdma::submit)));
 		std::array<rdma::send_wr, 2> sw;
-		communicate(sl, send_pack(sl, sw[0], rdma::const_region{std::span(buf).last(32), mr->lkey}, 2));
-		communicate(sl, send_pack(sl, sw[1], rdma::const_region{std::span(buf).last(32), mr->lkey}, 3));
-		communicate(sl, send_pack(sl, rdma::submit));
+		stdexec::sync_wait(communicate(sl, send_pack(sl, sw[0], rdma::const_region{std::span(buf).last(32), mr->lkey}, 2)));
+		stdexec::sync_wait(communicate(sl, send_pack(sl, sw[1], rdma::const_region{std::span(buf).last(32), mr->lkey}, 3)));
+		stdexec::sync_wait(communicate(sl, send_pack(sl, rdma::submit)));
 
 		std::array<::ibv_wc, 4> wc;
-		std::printf("polled %zu\n", communicate(cq, receive_pack(cq, std::span(wc))));
+		std::printf("polled %zu\n", value(communicate(cq, receive_pack(cq, std::span(wc)))));
 		::ibv_dereg_mr(mr);
 		::ibv_destroy_qp(qp);
 		::ibv_destroy_cq(cqh);

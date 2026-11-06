@@ -32,7 +32,7 @@ int main(int argc, char** argv) {
 
 		usb_urb::port in{fd, USBDEVFS_URB_TYPE_BULK, ep};
 		usb_urb::reaper reaper{fd};
-		std::jthread reaping([&] { reaper.run_one(); });  // 收割 1 个 URB
+		std::jthread reaping([&] { stdexec::sync_wait(reaper.run_one()); });  // 收割 1 个 URB
 
 		std::array<std::byte, 512> buf{};
 		auto [n] = stdexec::sync_wait(communicate(in, receive_pack(in, std::span(buf)))).value();

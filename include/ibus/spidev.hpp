@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
 #include <array>
 #include <cassert>
@@ -9,7 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <system_error>
+#include <type_traits>
 
 #include <linux/spi/spidev.h>
 #include <sys/ioctl.h>
@@ -17,8 +18,13 @@
 
 namespace ibus::spidev {
 
+// 段数在编译期确定的一段 spi_ioc_transfer：std::span<spi_ioc_transfer, N>（N 不是 dynamic_extent）。
+template <class S>
+concept static_transfers = requires { S::extent; } && (S::extent != std::dynamic_extent)
+	&& std::same_as<std::remove_const_t<typename S::element_type>, ::spi_ioc_transfer>;
+
 // port：一个 SPI 从机（已打开的 /dev/spidevB.C，由用户打开、配置模式和默认速率、关闭）。
-// 每次 communicate 是一次独立的片选（read / write）。同步，直接返回结果。
+// 每次 communicate 是一次独立的片选（read / write）。返回 sender：start 时一次系统调用，完成值是字节数，失败 set_error(errno)。
 struct port {
 	int fd;
 
@@ -33,17 +39,13 @@ struct port {
 	receive_packet receive_pack(std::span<std::byte> d) const noexcept { return {d}; }
 
 	// 1 段 send：write，MISO 上收回来的丢掉。返回发出的字节数。
-	std::size_t communicate(send_packet p) const {
-		::ssize_t r = ::write(fd, p.data.data(), p.data.size());
-		if (r < 0) throw std::system_error(errno, std::generic_category(), "spidev write");
-		return static_cast<std::size_t>(r);
+	auto communicate(send_packet p) const noexcept {
+		return detail::syscall<std::size_t>([fd = fd, p] noexcept { return ::write(fd, p.data.data(), p.data.size()); });
 	}
 
 	// 1 段 receive：read，MOSI 上发 0。返回收到的字节数。
-	std::size_t communicate(receive_packet p) const {
-		::ssize_t r = ::read(fd, p.data.data(), p.data.size());
-		if (r < 0) throw std::system_error(errno, std::generic_category(), "spidev read");
-		return static_cast<std::size_t>(r);
+	auto communicate(receive_packet p) const noexcept {
+		return detail::syscall<std::size_t>([fd = fd, p] noexcept { return ::read(fd, p.data.data(), p.data.size()); });
 	}
 };
 
@@ -87,12 +89,16 @@ struct message_port {
 		return x;
 	}
 
-	// 静态 n 段：spi_ioc_transfer[n] 原地构造，一次 SPI_IOC_MESSAGE(n)。返回总字节数。
-	std::size_t communicate(std::same_as<::spi_ioc_transfer> auto... x) const {
-		std::array<::spi_ioc_transfer, sizeof...(x)> a{x...};
-		int r = ::ioctl(fd, SPI_IOC_MESSAGE(sizeof...(x)), a.data());
-		if (r < 0) throw std::system_error(errno, std::generic_category(), "ioctl(SPI_IOC_MESSAGE)");
-		return static_cast<std::size_t>(r);
+	// 静态 n 段：用户自己的 spi_ioc_transfer[N]（在里面原地填好），一次 SPI_IOC_MESSAGE(N)，不拷贝。返回总字节数。
+	auto communicate_range(static_transfers auto x) const noexcept {
+		return detail::syscall<std::size_t>([fd = fd, x] noexcept { return ::ioctl(fd, SPI_IOC_MESSAGE(decltype(x)::extent), x.data()); });
+	}
+
+	// 便捷写法：每个参数是一段，放进 sender 里的一个数组（比直接用 communicate_range 多一次复制）。
+	auto communicate(std::same_as<::spi_ioc_transfer> auto... x) const noexcept {
+		return detail::syscall<std::size_t>([fd = fd, a = std::array<::spi_ioc_transfer, sizeof...(x)>{x...}] noexcept {
+			return ::ioctl(fd, SPI_IOC_MESSAGE(sizeof...(x)), a.data());
+		});
 	}
 
 private:

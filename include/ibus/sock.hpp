@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
 #include <cerrno>
 #include <cstddef>
@@ -19,7 +20,8 @@
 #include <sys/uio.h>
 
 // 所有 port 都不持有 fd：socket 由用户创建、连接、配置、关闭，port 只记下 fd。
-// 都是同步系统调用（阻不阻塞看 fd 自己），communicate / communicate_range 直接返回结果。
+// 都是同步系统调用（阻不阻塞看 fd 自己）：communicate / communicate_range 返回 sender，start 时做一次系统调用，
+// 完成值走 set_value，失败走 set_error(std::error_code)（errno）。
 // 每次调用的 flags 等是 send_pack / receive_pack（或 communicate_range）的参数。
 namespace ibus::sock {
 
@@ -37,11 +39,6 @@ struct pipe_region {
 };
 
 namespace detail {
-
-inline std::size_t check(::ssize_t r, char const* what) {
-	if (r < 0) throw std::system_error(errno, std::generic_category(), what);
-	return static_cast<std::size_t>(r);
-}
 
 inline ::iovec iov(std::span<std::byte const> d) noexcept { return {const_cast<std::byte*>(d.data()), d.size()}; }
 
@@ -82,30 +79,36 @@ struct port {
 	splice_in_packet receive_pack(pipe_region p, unsigned flags = 0) const noexcept { return {p, flags}; }
 
 	// send。返回发出的字节数。
-	std::size_t communicate(send_packet p) const { return detail::check(::send(fd, p.data.data(), p.data.size(), p.flags), "send"); }
+	auto communicate(send_packet p) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, p] noexcept { return ::send(fd, p.data.data(), p.data.size(), p.flags); });
+	}
 
 	// sendfile：文件 → socket。返回发出的字节数。
-	std::size_t communicate(sendfile_packet p) const {
-		::off_t off = p.region.offset;
-		return detail::check(::sendfile(fd, p.region.fd, &off, p.region.count), "sendfile");
+	auto communicate(sendfile_packet p) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, p] noexcept {
+			::off_t off = p.region.offset;
+			return ::sendfile(fd, p.region.fd, &off, p.region.count);
+		});
 	}
 
 	// splice：pipe → socket。返回搬运的字节数。
-	std::size_t communicate(splice_out_packet p) const {
-		return detail::check(::splice(p.from.fd, nullptr, fd, nullptr, p.from.count, p.flags), "splice");
+	auto communicate(splice_out_packet p) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, p] noexcept { return ::splice(p.from.fd, nullptr, fd, nullptr, p.from.count, p.flags); });
 	}
 
 	// recv。返回收到的字节数（0 怎么解读由用户决定；MSG_TRUNC 时是真实长度）。
-	std::size_t communicate(receive_packet p) const { return detail::check(::recv(fd, p.data.data(), p.data.size(), p.flags), "recv"); }
+	auto communicate(receive_packet p) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, p] noexcept { return ::recv(fd, p.data.data(), p.data.size(), p.flags); });
+	}
 
 	// splice：socket → pipe。返回搬运的字节数。
-	std::size_t communicate(splice_in_packet p) const {
-		return detail::check(::splice(fd, nullptr, p.to.fd, nullptr, p.to.count, p.flags), "splice");
+	auto communicate(splice_in_packet p) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, p] noexcept { return ::splice(fd, nullptr, p.to.fd, nullptr, p.to.count, p.flags); });
 	}
 };
 
 // errqueue_port：一个 socket 的错误队列（MSG_ZEROCOPY 的“可复用”通知、IP_RECVERR 的 ICMP 错误等）。
-// recvmsg(MSG_ERRQUEUE) 永不阻塞：队列空时以 EAGAIN 失败（抛异常）。要等，用户自己 poll(POLLERR)。
+// recvmsg(MSG_ERRQUEUE) 永不阻塞：队列空时以 EAGAIN 失败（set_error）。要等，用户自己 poll(POLLERR)。
 // 控制缓冲由用户给（至少 CMSG_SPACE(sizeof(sock_extended_err))），返回指向其中 sock_extended_err 的指针，解读由用户决定。
 struct errqueue_port {
 	int fd;
@@ -116,12 +119,15 @@ struct errqueue_port {
 
 	receive_packet receive_pack(std::span<std::byte> control) const noexcept { return {control}; }
 
-	::sock_extended_err const* communicate(receive_packet p) const {
-		::msghdr m{};
-		m.msg_control = p.control.data();
-		m.msg_controllen = p.control.size();
-		detail::check(::recvmsg(fd, &m, MSG_ERRQUEUE), "recvmsg(MSG_ERRQUEUE)");
-		return reinterpret_cast<::sock_extended_err const*>(CMSG_DATA(CMSG_FIRSTHDR(&m)));
+	auto communicate(receive_packet p) const noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(::sock_extended_err const*), stdexec::set_error_t(std::error_code)>(
+			[fd = fd, p](auto&& r) noexcept {
+				::msghdr m{};
+				m.msg_control = p.control.data();
+				m.msg_controllen = p.control.size();
+				if (::recvmsg(fd, &m, MSG_ERRQUEUE) < 0) return stdexec::set_error(std::move(r), ibus::detail::errno_code());
+				stdexec::set_value(std::move(r), reinterpret_cast<::sock_extended_err const*>(CMSG_DATA(CMSG_FIRSTHDR(&m))));
+			});
 	}
 };
 
@@ -133,8 +139,10 @@ struct writev_port {
 
 	::iovec send_pack(std::span<std::byte const> d) const noexcept { return detail::iov(d); }
 
-	std::size_t communicate_range(auto&& iovs) const {
-		return detail::check(::writev(fd, std::ranges::data(iovs), static_cast<int>(std::ranges::size(iovs))), "writev");
+	auto communicate_range(auto&& iovs) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::ranges::data(iovs), n = static_cast<int>(std::ranges::size(iovs))] noexcept {
+			return ::writev(fd, v, n);
+		});
 	}
 };
 
@@ -143,15 +151,17 @@ struct readv_port {
 
 	::iovec receive_pack(std::span<std::byte> d) const noexcept { return detail::iov(d); }
 
-	std::size_t communicate_range(auto&& iovs) const {
-		return detail::check(::readv(fd, std::ranges::data(iovs), static_cast<int>(std::ranges::size(iovs))), "readv");
+	auto communicate_range(auto&& iovs) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::ranges::data(iovs), n = static_cast<int>(std::ranges::size(iovs))] noexcept {
+			return ::readv(fd, v, n);
+		});
 	}
 };
 
 namespace detail {
 
 // sendmsg：gso_size != 0 时附带 UDP_SEGMENT cmsg，内核把这一块按 gso_size 切成多个 UDP 包发出。
-inline std::size_t sendmsg(int fd, ::iovec* v, std::size_t n, int flags, std::uint16_t gso_size) {
+inline ::ssize_t sendmsg(int fd, ::iovec* v, std::size_t n, int flags, std::uint16_t gso_size) noexcept {
 	alignas(::cmsghdr) char ctrl[CMSG_SPACE(sizeof(std::uint16_t))];
 	::msghdr m{};
 	m.msg_iov = v;
@@ -165,7 +175,7 @@ inline std::size_t sendmsg(int fd, ::iovec* v, std::size_t n, int flags, std::ui
 		c->cmsg_len = CMSG_LEN(sizeof(std::uint16_t));
 		std::memcpy(CMSG_DATA(c), &gso_size, sizeof(std::uint16_t));
 	}
-	return check(::sendmsg(fd, &m, flags), "sendmsg");
+	return ::sendmsg(fd, &m, flags);
 }
 
 }  // namespace detail
@@ -183,14 +193,18 @@ struct sendmsg_port {
 	send_packet send_pack(std::span<std::byte const> d, int flags = 0, std::uint16_t gso_size = 0) const noexcept { return {d, flags, gso_size}; }
 
 	// 1 段。返回发出的字节数。
-	std::size_t communicate(send_packet p) const {
-		::iovec v = detail::iov(p.data);
-		return detail::sendmsg(fd, &v, 1, p.flags, p.gso_size);
+	auto communicate(send_packet p) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, p] noexcept {
+			::iovec v = detail::iov(p.data);
+			return detail::sendmsg(fd, &v, 1, p.flags, p.gso_size);
+		});
 	}
 
 	// 动态 n 段：一段连续的 iovec。返回发出的字节数。
-	std::size_t communicate_range(auto&& iovs, int flags = 0, std::uint16_t gso_size = 0) const {
-		return detail::sendmsg(fd, std::ranges::data(iovs), std::ranges::size(iovs), flags, gso_size);
+	auto communicate_range(auto&& iovs, int flags = 0, std::uint16_t gso_size = 0) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::ranges::data(iovs), n = std::ranges::size(iovs), flags, gso_size] noexcept {
+			return detail::sendmsg(fd, v, n, flags, gso_size);
+		});
 	}
 };
 
@@ -213,24 +227,32 @@ struct recvmsg_port {
 
 	receive_packet receive_pack(std::span<std::byte> d, std::span<std::byte> control = {}, int flags = 0) const noexcept { return {d, control, flags}; }
 
-	result communicate(receive_packet p) const {
-		::iovec v = detail::iov(p.data);
-		return _receive(&v, 1, p.control, p.flags);
-	}
-
-	result communicate_range(auto&& iovs, std::span<std::byte> control = {}, int flags = 0) const {
-		return _receive(std::ranges::data(iovs), std::ranges::size(iovs), control, flags);
-	}
-
 private:
-	result _receive(::iovec* v, std::size_t n, std::span<std::byte> control, int flags) const {
+	static auto _make(auto f) noexcept { return ibus::detail::complete<stdexec::set_value_t(result), stdexec::set_error_t(std::error_code)>(std::move(f)); }
+
+	static void _receive(auto&& r, int fd, ::iovec* v, std::size_t n, std::span<std::byte> control, int flags) noexcept {
 		::msghdr m{};
 		m.msg_iov = v;
 		m.msg_iovlen = n;
 		m.msg_control = control.data();
 		m.msg_controllen = control.size();
-		std::size_t r = detail::check(::recvmsg(fd, &m, flags), "recvmsg");
-		return {r, m.msg_flags, m.msg_controllen};
+		::ssize_t k = ::recvmsg(fd, &m, flags);
+		if (k < 0) return stdexec::set_error(std::move(r), ibus::detail::errno_code());
+		stdexec::set_value(std::move(r), result{static_cast<std::size_t>(k), m.msg_flags, m.msg_controllen});
+	}
+
+public:
+	auto communicate(receive_packet p) const noexcept {
+		return _make([fd = fd, p](auto&& r) noexcept {
+			::iovec v = detail::iov(p.data);
+			_receive(std::move(r), fd, &v, 1, p.control, p.flags);
+		});
+	}
+
+	auto communicate_range(auto&& iovs, std::span<std::byte> control = {}, int flags = 0) const noexcept {
+		return _make([fd = fd, v = std::ranges::data(iovs), n = std::ranges::size(iovs), control, flags](auto&& r) noexcept {
+			_receive(std::move(r), fd, v, n, control, flags);
+		});
 	}
 };
 
@@ -248,8 +270,10 @@ struct sendmmsg_port {
 		return h;
 	}
 
-	std::size_t communicate_range(auto&& msgs, int flags = 0) const {
-		return detail::check(::sendmmsg(fd, std::ranges::data(msgs), static_cast<unsigned>(std::ranges::size(msgs)), flags), "sendmmsg");
+	auto communicate_range(auto&& msgs, int flags = 0) const noexcept {
+		return ibus::detail::syscall<std::size_t>([fd = fd, m = std::ranges::data(msgs), n = static_cast<unsigned>(std::ranges::size(msgs)), flags] noexcept {
+			return ::sendmmsg(fd, m, n, flags);
+		});
 	}
 };
 
@@ -264,8 +288,11 @@ struct recvmmsg_port {
 	}
 
 	// flags：例如 MSG_WAITFORONE（收到第一个后不再阻塞）；timeout：recvmmsg 的超时参数。
-	std::size_t communicate_range(auto&& msgs, int flags = 0, ::timespec* timeout = nullptr) const {
-		return detail::check(::recvmmsg(fd, std::ranges::data(msgs), static_cast<unsigned>(std::ranges::size(msgs)), flags, timeout), "recvmmsg");
+	auto communicate_range(auto&& msgs, int flags = 0, ::timespec* timeout = nullptr) const noexcept {
+		return ibus::detail::syscall<std::size_t>(
+			[fd = fd, m = std::ranges::data(msgs), n = static_cast<unsigned>(std::ranges::size(msgs)), flags, timeout] noexcept {
+				return ::recvmmsg(fd, m, n, flags, timeout);
+			});
 	}
 };
 

@@ -25,15 +25,15 @@ int main(int argc, char** argv) {
 
 		// read word data：命令 0x10 + 收 2 字节
 		std::uint16_t w;
-		communicate(l, send_pack(l, smbus::command{0x10}), receive_pack(l, w));
+		stdexec::sync_wait(communicate(l, send_pack(l, smbus::command{0x10}), receive_pack(l, w)));
 		std::printf("word 0x10 = %#06x\n", w);
 
 		// write byte data：命令 0x20 + 1 字节
-		communicate(l, send_pack(l, smbus::command{0x20}), send_pack(l, std::uint8_t{0x5a}));
+		stdexec::sync_wait(communicate(l, send_pack(l, smbus::command{0x20}), send_pack(l, std::uint8_t{0x5a})));
 
 		// block read：命令 0x30 + 从机给出长度（最多 32）+ 数据
 		::i2c_smbus_data blk{};
-		communicate(l, send_pack(l, smbus::command{0x30}), receive_pack(l, blk));
+		stdexec::sync_wait(communicate(l, send_pack(l, smbus::command{0x30}), receive_pack(l, blk)));
 		std::printf("block 0x30: %u bytes\n", blk.block[0]);
 		::close(fd);
 	} catch (std::exception const& e) {

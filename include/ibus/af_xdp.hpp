@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -8,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <system_error>
 
 #include <linux/if_xdp.h>
 #include <sys/socket.h>
@@ -18,6 +18,7 @@
 //   communicate(send_pack(publish)) 推进 producer 发布出去（TX 环还会 sendto 唤醒内核）；
 //   communicate(receive_pack()) 取下一个描述：返回指向环里那一项的指针，没有就是 nullptr（不拷贝）；
 //   communicate(send_pack(publish)) 在消费者一侧发布 consumer，归还已取出的槽位。
+// communicate 都返回 sender，start 时执行；sender 里记的是 port 的地址，start 之前 port 必须还活着。
 // port 不持有资源：AF_XDP socket、UMEM 注册、环的 mmap、bind 都由用户做，port 只记下环的位置。
 namespace ibus::af_xdp {
 
@@ -55,13 +56,17 @@ struct producer_port {
 	publish_packet send_pack(publish_t) const noexcept { return {}; }
 
 	// 写进下一个槽位（不发布）。空位不够是用户的逻辑错误。
-	void communicate(write_packet p) noexcept {
-		assert(size - (pending - detail::load(consumer)) > 0 && "af_xdp: ring full");
-		desc[pending++ & (size - 1)] = p.d;
+	auto communicate(write_packet p) noexcept {
+		return ibus::detail::nothrow<void>([self = this, p] noexcept {
+			assert(self->size - (self->pending - detail::load(self->consumer)) > 0 && "af_xdp: ring full");
+			self->desc[self->pending++ & (self->size - 1)] = p.d;
+		});
 	}
 
 	// 发布：此后内核才看得到这些描述。
-	void communicate(publish_packet) noexcept { detail::store(producer, pending); }
+	auto communicate(publish_packet) noexcept {
+		return ibus::detail::nothrow<void>([self = this] noexcept { detail::store(self->producer, self->pending); });
+	}
 };
 
 // 消费者一侧的 port：RX 环、completion 环。pending 是已取出但还没归还的 consumer 位置（只有用户态写 consumer）。
@@ -86,13 +91,17 @@ struct consumer_port {
 	publish_packet send_pack(publish_t) const noexcept { return {}; }
 
 	// 取下一个描述：指向环里的那一项，归还（publish）之前一直有效；没有就是 nullptr。
-	Desc const* communicate(read_packet) noexcept {
-		if (pending == detail::load(producer)) return nullptr;
-		return &desc[pending++ & (size - 1)];
+	auto communicate(read_packet) noexcept {
+		return ibus::detail::nothrow<Desc const*>([self = this] noexcept -> Desc const* {
+			if (self->pending == detail::load(self->producer)) return nullptr;
+			return &self->desc[self->pending++ & (self->size - 1)];
+		});
 	}
 
 	// 归还已取出的槽位：发布 consumer。
-	void communicate(publish_packet) noexcept { detail::store(consumer, pending); }
+	auto communicate(publish_packet) noexcept {
+		return ibus::detail::nothrow<void>([self = this] noexcept { detail::store(self->consumer, self->pending); });
+	}
 };
 
 // TX 环：发布后再 sendto(MSG_DONTWAIT) 唤醒内核。fill 环、completion 环、RX 环直接用 producer_port / consumer_port。
@@ -101,10 +110,13 @@ struct tx_port : producer_port<::xdp_desc> {
 
 	using producer_port::communicate;
 
-	void communicate(publish_packet p) {
-		producer_port::communicate(p);
-		if (::sendto(xsk, nullptr, 0, MSG_DONTWAIT, nullptr, 0) < 0 && errno != EAGAIN && errno != EBUSY && errno != ENOBUFS)
-			throw std::system_error(errno, std::generic_category(), "af_xdp sendto");
+	// EAGAIN / EBUSY / ENOBUFS 表示内核已在处理或暂时没空，不算错。
+	auto communicate(publish_packet) noexcept {
+		return ibus::detail::syscall<void>([self = this] noexcept {
+			detail::store(self->producer, self->pending);
+			if (::sendto(self->xsk, nullptr, 0, MSG_DONTWAIT, nullptr, 0) < 0 && errno != EAGAIN && errno != EBUSY && errno != ENOBUFS) return -1;
+			return 0;
+		});
 	}
 };
 

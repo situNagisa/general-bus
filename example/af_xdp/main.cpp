@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <cstring>
 #include <exception>
 #include <span>
@@ -18,6 +19,9 @@
 #include <net/if.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
 	using namespace ibus;
@@ -63,23 +67,23 @@ int main(int argc, char** argv) {
 		auto rx = af_xdp::rx_port::at(rx_m, off.rx, ring_size);
 
 		// 前一半块借给内核接收
-		for (std::uint32_t i = 0; i < frames / 2; ++i) communicate(fill, send_pack(fill, std::uint64_t{i * frame_size}));
-		communicate(fill, send_pack(fill, af_xdp::publish));
+		for (std::uint32_t i = 0; i < frames / 2; ++i) stdexec::sync_wait(communicate(fill, send_pack(fill, std::uint64_t{i * frame_size})));
+		stdexec::sync_wait(communicate(fill, send_pack(fill, af_xdp::publish)));
 
 		// 后一半块用来发：写一个 64 字节的帧（内容不重要，lo 上 XDP_COPY 模式能发出）
 		std::uint64_t at = (frames / 2) * frame_size;
 		std::memset(static_cast<std::byte*>(umem) + at, 0xff, 64);
-		communicate(tx, send_pack(tx, ::xdp_desc{at, 64, 0}));
-		communicate(tx, send_pack(tx, af_xdp::publish));
+		stdexec::sync_wait(communicate(tx, send_pack(tx, ::xdp_desc{at, 64, 0})));
+		stdexec::sync_wait(communicate(tx, send_pack(tx, af_xdp::publish)));
 
 		// completion 环：内核发完会把块的偏移放回来（XDP_COPY 下 sendto 返回时通常已经完成）
-		if (auto* done = communicate(comp, receive_pack(comp))) {
+		if (auto* done = value(communicate(comp, receive_pack(comp)))) {
 			std::printf("tx completed: umem offset %llu\n", static_cast<unsigned long long>(*done));
-			communicate(comp, send_pack(comp, af_xdp::publish));
+			stdexec::sync_wait(communicate(comp, send_pack(comp, af_xdp::publish)));
 		} else {
 			std::printf("tx not completed yet\n");
 		}
-		std::printf("rx got a frame: %s（需要 XDP 程序把包重定向到这个 socket，这里没有加载）\n", communicate(rx, receive_pack(rx)) ? "yes" : "no");
+		std::printf("rx got a frame: %s（需要 XDP 程序把包重定向到这个 socket，这里没有加载）\n", value(communicate(rx, receive_pack(rx))) ? "yes" : "no");
 		::close(xsk);
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());

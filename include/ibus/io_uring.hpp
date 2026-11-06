@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -8,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <system_error>
 
 #include <linux/io_uring.h>
 #include <sys/syscall.h>
@@ -20,7 +20,8 @@
 //   communicate(sq, send_pack(sq, uring::submit[, wait_nr]))  发布 tail，一次 io_uring_enter（wait_nr > 0 时顺带等至少这么多个 CQE）
 //   communicate(cq, receive_pack(cq))       取下一个 CQE：返回指向共享内存的指针，没有就是 nullptr（不等待、不拷贝、无系统调用）
 //   communicate(cq, send_pack(cq, uring::release))  归还已取出的 CQE：发布 head（无系统调用）
-// 每个对外函数最多一次系统调用；出错（包括 EINTR）直接抛异常，重试由用户决定。
+// communicate 都返回 sender，start 时执行。每个最多一次系统调用；出错（包括 EINTR）set_error(errno)，重试由用户决定。
+// sender 里记的是 port 的地址：start 之前 port 必须还活着。
 // port 不持有资源：io_uring_setup、mmap、munmap、close 都由用户做。
 // 要求：SQ 带索引数组（不设 IORING_SETUP_NO_SQARRAY），SQE 64 字节、CQE 16 字节（不设 SQE128 / CQE32）。
 namespace ibus::uring {
@@ -100,7 +101,18 @@ struct sq_port {
 	submit_packet send_pack(submit_t, std::uint32_t wait_nr = 0) const noexcept { return {wait_nr}; }
 
 	// 取下一个槽位，原地填 SQE、写下标（不发布）。SQ 满是用户的逻辑错误（用户自己先提交腾位置）。
-	void communicate(sqe_packet p) noexcept {
+	auto communicate(sqe_packet p) noexcept {
+		return ibus::detail::nothrow<void>([self = this, p] noexcept { self->_write(p); });
+	}
+
+	// 发布 tail，最多一次 io_uring_enter。完成值是内核接受的项数（SQPOLL 时是发布的项数）。
+	// 非 SQPOLL：enter(n, wait_nr, wait_nr ? GETEVENTS : 0)；SQPOLL：只有内核线程睡着、或要等待时才 enter。
+	auto communicate(submit_packet p) noexcept {
+		return ibus::detail::syscall<std::size_t>([self = this, p] noexcept { return self->_submit(p); });
+	}
+
+private:
+	void _write(sqe_packet p) noexcept {
 		assert(pending - detail::load_acquire(head) < entries && "uring: SQ full");
 		std::uint32_t slot = pending & mask;
 		::io_uring_sqe& s = sqes[slot];
@@ -123,9 +135,8 @@ struct sq_port {
 		++pending;
 	}
 
-	// 发布 tail，最多一次 io_uring_enter。返回内核接受的项数（SQPOLL 时是发布的项数）。
-	// 非 SQPOLL：enter(n, wait_nr, wait_nr ? GETEVENTS : 0)；SQPOLL：只有内核线程睡着、或要等待时才 enter。
-	std::size_t communicate(submit_packet p) {
+	// 返回 < 0 表示失败（errno）。
+	long _submit(submit_packet p) noexcept {
 		std::uint32_t n = pending - published;
 		detail::store_release(tail, pending);
 		published = pending;
@@ -134,12 +145,10 @@ struct sq_port {
 			// tail 的写和 flags 的读之间要全屏障。
 			std::atomic_thread_fence(std::memory_order_seq_cst);
 			if (detail::load_relaxed(flags) & IORING_SQ_NEED_WAKEUP) f |= IORING_ENTER_SQ_WAKEUP;
-			if (f && detail::enter(ring_fd, 0, p.wait_nr, f) < 0) throw std::system_error(errno, std::generic_category(), "io_uring_enter");
+			if (f && detail::enter(ring_fd, 0, p.wait_nr, f) < 0) return -1;
 			return n;
 		}
-		int k = detail::enter(ring_fd, n, p.wait_nr, f);
-		if (k < 0) throw std::system_error(errno, std::generic_category(), "io_uring_enter");
-		return static_cast<std::size_t>(k);
+		return detail::enter(ring_fd, n, p.wait_nr, f);
 	}
 };
 
@@ -168,13 +177,17 @@ struct cq_port {
 
 	// 取下一个 CQE：指向共享内存里的那一项，归还（release）之前一直有效；没有就是 nullptr。
 	// res 不解读：< 0 是 -errno，由用户判断。
-	::io_uring_cqe const* communicate(cqe_packet) noexcept {
-		if (pending == detail::load_acquire(tail)) return nullptr;
-		return &cqes[pending++ & mask];
+	auto communicate(cqe_packet) noexcept {
+		return ibus::detail::nothrow<::io_uring_cqe const*>([self = this] noexcept -> ::io_uring_cqe const* {
+			if (self->pending == detail::load_acquire(self->tail)) return nullptr;
+			return &self->cqes[self->pending++ & self->mask];
+		});
 	}
 
 	// 归还已取出的 CQE：发布 head，内核才能复用这些槽位。
-	void communicate(release_packet) noexcept { detail::store_release(head, pending); }
+	auto communicate(release_packet) noexcept {
+		return ibus::detail::nothrow<void>([self = this] noexcept { detail::store_release(self->head, self->pending); });
+	}
 };
 
 }  // namespace ibus::uring

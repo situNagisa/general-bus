@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdio>
+#include <tuple>
 #include <exception>
 #include <span>
 #include <system_error>
@@ -14,6 +15,9 @@
 #include <unistd.h>
 
 using namespace ibus;
+
+// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
@@ -34,7 +38,7 @@ int main(int argc, char** argv) {
 			.wIndex = 0,
 			.wLength = htole16(desc.size()),
 		};
-		auto n = communicate(l, send_pack(l, setup, 1000), receive_pack(l, std::span<std::byte>(desc)));
+		auto n = value(communicate(l, send_pack(l, setup, 1000), receive_pack(l, std::span<std::byte>(desc))));
 		auto const* d = reinterpret_cast<::usb_device_descriptor const*>(desc.data());
 		std::printf("%zu bytes: idVendor=%04x idProduct=%04x\n", n, le16toh(d->idVendor), le16toh(d->idProduct));
 		::close(fd);

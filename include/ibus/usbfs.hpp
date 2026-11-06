@@ -1,12 +1,12 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <span>
-#include <system_error>
 
 #include <endian.h>
 #include <linux/usb/ch9.h>
@@ -16,7 +16,7 @@
 namespace ibus::usbfs {
 
 // port：一个 USB 设备的默认控制端点（已打开的 /dev/bus/usb/BBB/DDD，由用户打开、关闭）。
-// USBDEVFS_CONTROL 是同步的，直接返回结果。
+// USBDEVFS_CONTROL 是同步的：communicate 返回 sender，start 时一次 ioctl，完成值是数据阶段的字节数，失败 set_error(errno)。
 struct port {
 	int fd;
 
@@ -35,38 +35,38 @@ struct port {
 	out_packet send_pack(std::span<std::byte const> d) const noexcept { return {d}; }
 	in_packet receive_pack(std::span<std::byte> d) const noexcept { return {d}; }
 
-	// 控制传输，只有 setup 阶段。返回 0。
-	std::size_t communicate(setup_packet s) const { return _control(s, nullptr); }
+private:
+	auto _control(setup_packet const& s, void* data) const noexcept {
+		return detail::syscall<std::size_t>([fd = fd, s, data] noexcept {
+			::usbdevfs_ctrltransfer c{
+				.bRequestType = s.setup.bRequestType,
+				.bRequest = s.setup.bRequest,
+				.wValue = le16toh(s.setup.wValue),
+				.wIndex = le16toh(s.setup.wIndex),
+				.wLength = le16toh(s.setup.wLength),
+				.timeout = s.timeout_ms,
+				.data = data,
+			};
+			return ::ioctl(fd, USBDEVFS_CONTROL, &c);
+		});
+	}
 
-	// 控制传输，setup + OUT 数据阶段。返回发出的字节数。
-	std::size_t communicate(setup_packet s, out_packet d) const {
+public:
+	// 控制传输，只有 setup 阶段。完成值 0。
+	auto communicate(setup_packet s) const noexcept { return _control(s, nullptr); }
+
+	// 控制传输，setup + OUT 数据阶段。完成值是发出的字节数。
+	auto communicate(setup_packet s, out_packet d) const noexcept {
 		assert((s.setup.bRequestType & USB_DIR_IN) == 0 && "usbfs: OUT data stage but bRequestType is IN");
 		assert(d.data.size() == le16toh(s.setup.wLength) && "usbfs: data length != wLength");
 		return _control(s, const_cast<std::byte*>(d.data.data()));
 	}
 
-	// 控制传输，setup + IN 数据阶段。返回收到的字节数。
-	std::size_t communicate(setup_packet s, in_packet d) const {
+	// 控制传输，setup + IN 数据阶段。完成值是收到的字节数。
+	auto communicate(setup_packet s, in_packet d) const noexcept {
 		assert((s.setup.bRequestType & USB_DIR_IN) != 0 && "usbfs: IN data stage but bRequestType is OUT");
 		assert(d.data.size() == le16toh(s.setup.wLength) && "usbfs: data length != wLength");
 		return _control(s, d.data.data());
-	}
-
-private:
-	std::size_t _control(setup_packet const& s, void* data) const {
-		::usb_ctrlrequest const& setup = s.setup;
-		::usbdevfs_ctrltransfer c{
-			.bRequestType = setup.bRequestType,
-			.bRequest = setup.bRequest,
-			.wValue = le16toh(setup.wValue),
-			.wIndex = le16toh(setup.wIndex),
-			.wLength = le16toh(setup.wLength),
-			.timeout = s.timeout_ms,
-			.data = data,
-		};
-		int r = ::ioctl(fd, USBDEVFS_CONTROL, &c);
-		if (r < 0) throw std::system_error(errno, std::generic_category(), "ioctl(USBDEVFS_CONTROL)");
-		return static_cast<std::size_t>(r);
 	}
 };
 

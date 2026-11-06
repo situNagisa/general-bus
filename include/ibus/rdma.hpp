@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ibus/cpo.hpp>
+#include <ibus/sender.hpp>
 
 #include <cerrno>
 #include <cstddef>
@@ -85,17 +86,23 @@ struct send_port {
 	submit_packet send_pack(submit_t) const noexcept { return {}; }
 
 	// 接到链表尾部。
-	void communicate(wr_packet p) noexcept {
-		if (!head) tail = &head;
-		*tail = &p.w->wr;
-		tail = &p.w->wr.next;
+	auto communicate(wr_packet p) noexcept {
+		return ibus::detail::nothrow<void>([self = this, p] noexcept {
+			if (!self->head) self->tail = &self->head;
+			*self->tail = &p.w->wr;
+			self->tail = &p.w->wr.next;
+		});
 	}
 
 	// 一次 ibv_post_send 提交整条链表。
-	void communicate(submit_packet) {
-		::ibv_send_wr* h = std::exchange(head, nullptr);
-		::ibv_send_wr* bad = nullptr;
-		if (int e = ::ibv_post_send(qp, h, &bad)) throw std::system_error(e, std::generic_category(), "ibv_post_send");
+	// 完成值为空；失败 set_error(ibv_post_send 返回的错误码)。
+	auto communicate(submit_packet) noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(std::error_code)>([self = this](auto&& r) noexcept {
+			::ibv_send_wr* h = std::exchange(self->head, nullptr);
+			::ibv_send_wr* bad = nullptr;
+			if (int e = ::ibv_post_send(self->qp, h, &bad)) return stdexec::set_error(std::move(r), std::error_code(e, std::generic_category()));
+			stdexec::set_value(std::move(r));
+		});
 	}
 
 private:
@@ -139,16 +146,22 @@ struct recv_port {
 	}
 	submit_packet send_pack(submit_t) const noexcept { return {}; }
 
-	void communicate(wr_packet p) noexcept {
-		if (!head) tail = &head;
-		*tail = &p.w->wr;
-		tail = &p.w->wr.next;
+	auto communicate(wr_packet p) noexcept {
+		return ibus::detail::nothrow<void>([self = this, p] noexcept {
+			if (!self->head) self->tail = &self->head;
+			*self->tail = &p.w->wr;
+			self->tail = &p.w->wr.next;
+		});
 	}
 
-	void communicate(submit_packet) {
-		::ibv_recv_wr* h = std::exchange(head, nullptr);
-		::ibv_recv_wr* bad = nullptr;
-		if (int e = ::ibv_post_recv(qp, h, &bad)) throw std::system_error(e, std::generic_category(), "ibv_post_recv");
+	// 完成值为空；失败 set_error(ibv_post_recv 返回的错误码)。
+	auto communicate(submit_packet) noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(std::error_code)>([self = this](auto&& r) noexcept {
+			::ibv_recv_wr* h = std::exchange(self->head, nullptr);
+			::ibv_recv_wr* bad = nullptr;
+			if (int e = ::ibv_post_recv(self->qp, h, &bad)) return stdexec::set_error(std::move(r), std::error_code(e, std::generic_category()));
+			stdexec::set_value(std::move(r));
+		});
 	}
 };
 
@@ -163,10 +176,13 @@ struct cq_port {
 
 	poll_packet receive_pack(std::span<::ibv_wc> out) const noexcept { return {out}; }
 
-	std::size_t communicate(poll_packet p) const {
-		int n = ::ibv_poll_cq(cq, static_cast<int>(p.out.size()), p.out.data());
-		if (n < 0) throw std::system_error(EIO, std::generic_category(), "ibv_poll_cq");
-		return static_cast<std::size_t>(n);
+	// 完成值是取到的个数；ibv_poll_cq 失败（返回负数，不设 errno）时 set_error(EIO)。
+	auto communicate(poll_packet p) const noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(std::size_t), stdexec::set_error_t(std::error_code)>([cq = cq, p](auto&& r) noexcept {
+			int n = ::ibv_poll_cq(cq, static_cast<int>(p.out.size()), p.out.data());
+			if (n < 0) return stdexec::set_error(std::move(r), std::error_code(EIO, std::generic_category()));
+			stdexec::set_value(std::move(r), static_cast<std::size_t>(n));
+		});
 	}
 };
 

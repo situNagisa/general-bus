@@ -8,7 +8,8 @@ namespace ibus {
 // CPO 不加约束，只转发到 port 的成员。
 // send_pack / receive_pack / transceive_pack 的参数（包括每次传输的属性：flags、速率、超时等）和返回类型都由 port 自己定；
 // port 支持哪些组合由它自己的 communicate / communicate_range 重载决定。
-// 同步就能完成的操作直接返回结果；只有真正需要异步完成的才返回 sender。
+// communicate / communicate_range 一律返回 sender：完成值走 set_value，错误走 set_error(std::error_code)，不抛异常。
+// 同步的操作在 start 时就地完成；调用方要结果就 sync_wait。
 struct send_pack_t {
 	constexpr auto operator()(auto& port, auto&&... args) const
 		-> decltype(port.send_pack(std::forward<decltype(args)>(args)...)) {
