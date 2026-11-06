@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <system_error>
 #include <utility>
 
 #include <infiniband/verbs.h>
@@ -59,7 +58,7 @@ struct recv_wr {
 struct send_queue_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value() && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = send_queue_receiver>
 concept send_queue = requires(P& p, send_wr& w, const_region out, region in, remote r, std::uint64_t wr_id, unsigned send_flags) {
@@ -74,7 +73,7 @@ concept send_queue = requires(P& p, send_wr& w, const_region out, region in, rem
 struct receive_queue_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value() && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = receive_queue_receiver>
 concept receive_queue = requires(P& p, recv_wr& w, region in, std::uint64_t wr_id) {
@@ -87,7 +86,7 @@ concept receive_queue = requires(P& p, recv_wr& w, region in, std::uint64_t wr_i
 struct completion_queue_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = completion_queue_receiver>
 concept completion_queue = requires(P& p, std::span<::ibv_wc> out) {
@@ -138,10 +137,10 @@ struct send_port {
 	// 一次 ibv_post_send 提交整条链表。
 	// 完成值为空；失败 set_error(ibv_post_send 返回的错误码)。
 	auto communicate(submit_packet) noexcept {
-		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(std::error_code)>([self = this](auto&& r) noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(int)>([self = this](auto&& r) noexcept {
 			::ibv_send_wr* h = std::exchange(self->head, nullptr);
 			::ibv_send_wr* bad = nullptr;
-			if (int e = ::ibv_post_send(self->qp, h, &bad)) return stdexec::set_error(std::move(r), std::error_code(e, std::generic_category()));
+			if (int e = ::ibv_post_send(self->qp, h, &bad)) return stdexec::set_error(std::move(r), e);
 			stdexec::set_value(std::move(r));
 		});
 	}
@@ -197,10 +196,10 @@ struct recv_port {
 
 	// 完成值为空；失败 set_error(ibv_post_recv 返回的错误码)。
 	auto communicate(submit_packet) noexcept {
-		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(std::error_code)>([self = this](auto&& r) noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(int)>([self = this](auto&& r) noexcept {
 			::ibv_recv_wr* h = std::exchange(self->head, nullptr);
 			::ibv_recv_wr* bad = nullptr;
-			if (int e = ::ibv_post_recv(self->qp, h, &bad)) return stdexec::set_error(std::move(r), std::error_code(e, std::generic_category()));
+			if (int e = ::ibv_post_recv(self->qp, h, &bad)) return stdexec::set_error(std::move(r), e);
 			stdexec::set_value(std::move(r));
 		});
 	}
@@ -219,9 +218,9 @@ struct cq_port {
 
 	// 完成值是取到的个数；ibv_poll_cq 失败（返回负数，不设 errno）时 set_error(EIO)。
 	auto communicate(poll_packet p) const noexcept {
-		return ibus::detail::complete<stdexec::set_value_t(std::size_t), stdexec::set_error_t(std::error_code)>([cq = cq, p](auto&& r) noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(std::size_t), stdexec::set_error_t(int)>([cq = cq, p](auto&& r) noexcept {
 			int n = ::ibv_poll_cq(cq, static_cast<int>(p.out.size()), p.out.data());
-			if (n < 0) return stdexec::set_error(std::move(r), std::error_code(EIO, std::generic_category()));
+			if (n < 0) return stdexec::set_error(std::move(r), EIO);
 			stdexec::set_value(std::move(r), static_cast<std::size_t>(n));
 		});
 	}

@@ -9,7 +9,6 @@
 #include <cstring>
 #include <ranges>
 #include <span>
-#include <system_error>
 #include <type_traits>
 
 #include <fcntl.h>
@@ -22,7 +21,7 @@
 
 // 所有 port 都不持有 fd：socket 由用户创建、连接、配置、关闭，port 只记下 fd。
 // 都是同步系统调用（阻不阻塞看 fd 自己）：communicate / communicate_range 返回 sender，start 时做一次系统调用，
-// 完成值走 set_value，失败走 set_error(std::error_code)（errno）。
+// 完成值走 set_value，失败走 set_error(errno)（errno）。
 // 每次调用的 flags 等是 send_pack / receive_pack 的参数；communicate / communicate_range 不接受额外参数，
 // 动态 n 段要用的 flags 等是 port 的成员，由用户设置。
 // 下面先是 concept（各种 port 的结构），再是满足它们的便利 port。
@@ -57,7 +56,7 @@ struct recvmsg_result {
 struct stream_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = stream_receiver>
 concept stream = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in, int flags) {
@@ -70,7 +69,7 @@ concept stream = requires(P& p, std::span<std::byte const> out, std::span<std::b
 struct file_send_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = file_send_receiver>
 concept file_send = requires(P& p, file_region r) {
@@ -82,7 +81,7 @@ concept file_send = requires(P& p, file_region r) {
 struct splicing_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = splicing_receiver>
 concept splicing = requires(P& p, pipe_region r, unsigned flags) {
@@ -95,7 +94,7 @@ concept splicing = requires(P& p, pipe_region r, unsigned flags) {
 struct error_queue_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(::sock_extended_err const*) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = error_queue_receiver>
 concept error_queue = requires(P& p, std::span<std::byte> control) {
@@ -107,7 +106,7 @@ concept error_queue = requires(P& p, std::span<std::byte> control) {
 struct gather_write_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = gather_write_receiver>
 concept gather_write = requires(P& p, std::span<std::byte const> out, std::span<::iovec> iovs) {
@@ -120,7 +119,7 @@ concept gather_write = requires(P& p, std::span<std::byte const> out, std::span<
 struct scatter_read_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = scatter_read_receiver>
 concept scatter_read = requires(P& p, std::span<std::byte> in, std::span<::iovec> iovs) {
@@ -133,7 +132,7 @@ concept scatter_read = requires(P& p, std::span<std::byte> in, std::span<::iovec
 struct message_send_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = message_send_receiver>
 concept message_send = requires(P& p, std::span<std::byte const> out, std::span<::iovec> iovs, int flags, std::uint16_t gso_size) {
@@ -147,7 +146,7 @@ concept message_send = requires(P& p, std::span<std::byte const> out, std::span<
 struct message_receive_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(recvmsg_result) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = message_receive_receiver>
 concept message_receive = requires(P& p, std::span<std::byte> in, std::span<std::byte> control, std::span<::iovec> iovs, int flags) {
@@ -160,7 +159,7 @@ concept message_receive = requires(P& p, std::span<std::byte> in, std::span<std:
 struct multi_send_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = multi_send_receiver>
 concept multi_send = requires(P& p, std::span<::iovec> iov, std::span<::mmsghdr> msgs) {
@@ -173,7 +172,7 @@ concept multi_send = requires(P& p, std::span<::iovec> iov, std::span<::mmsghdr>
 struct multi_receive_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = multi_receive_receiver>
 concept multi_receive = requires(P& p, std::span<::iovec> iov, std::span<::mmsghdr> msgs) {
@@ -263,12 +262,12 @@ struct errqueue_port {
 	receive_packet receive_pack(std::span<std::byte> control) const noexcept { return {control}; }
 
 	auto communicate(receive_packet p) const noexcept {
-		return ibus::detail::complete<stdexec::set_value_t(::sock_extended_err const*), stdexec::set_error_t(std::error_code)>(
+		return ibus::detail::complete<stdexec::set_value_t(::sock_extended_err const*), stdexec::set_error_t(int)>(
 			[fd = fd, p](auto&& r) noexcept {
 				::msghdr m{};
 				m.msg_control = p.control.data();
 				m.msg_controllen = p.control.size();
-				if (::recvmsg(fd, &m, MSG_ERRQUEUE) < 0) return stdexec::set_error(std::move(r), ibus::detail::errno_code());
+				if (::recvmsg(fd, &m, MSG_ERRQUEUE) < 0) return stdexec::set_error(std::move(r), errno);
 				stdexec::set_value(std::move(r), reinterpret_cast<::sock_extended_err const*>(CMSG_DATA(CMSG_FIRSTHDR(&m))));
 			});
 	}
@@ -421,7 +420,7 @@ struct recvmsg_port {
 	receive_packet receive_pack(std::span<std::byte> d, std::span<std::byte> control = {}, int flags = 0) const noexcept { return {d, control, flags}; }
 
 private:
-	static auto _make(auto f) noexcept { return ibus::detail::complete<stdexec::set_value_t(result), stdexec::set_error_t(std::error_code)>(std::move(f)); }
+	static auto _make(auto f) noexcept { return ibus::detail::complete<stdexec::set_value_t(result), stdexec::set_error_t(int)>(std::move(f)); }
 
 	static void _receive(auto&& r, int fd, ::iovec* v, std::size_t n, std::span<std::byte> control, int flags) noexcept {
 		::msghdr m{};
@@ -430,7 +429,7 @@ private:
 		m.msg_control = control.data();
 		m.msg_controllen = control.size();
 		::ssize_t k = ::recvmsg(fd, &m, flags);
-		if (k < 0) return stdexec::set_error(std::move(r), ibus::detail::errno_code());
+		if (k < 0) return stdexec::set_error(std::move(r), errno);
 		stdexec::set_value(std::move(r), result{static_cast<std::size_t>(k), m.msg_flags, m.msg_controllen});
 	}
 

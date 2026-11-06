@@ -4,7 +4,6 @@
 #include <ibus/sender.hpp>
 
 #include <cstddef>
-#include <system_error>
 #include <cstdint>
 #include <ranges>
 #include <span>
@@ -22,7 +21,7 @@ namespace ibus::i2c_rdwr {
 struct transaction_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = transaction_receiver>
 concept transaction = requires(P& p, std::uint16_t addr, std::span<std::byte const> out, std::span<std::byte> in, std::uint16_t flags,

@@ -7,7 +7,6 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
-#include <system_error>
 #include <cstdint>
 #include <span>
 
@@ -56,7 +55,7 @@ struct submission_queue_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value() && noexcept {}
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = submission_queue_receiver>
 concept submission_queue = requires(P& p, int fd, std::span<std::byte const> out, std::span<std::byte> in, std::uint64_t user_data,

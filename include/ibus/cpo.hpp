@@ -20,7 +20,8 @@ concept contiguous_range_of = std::ranges::contiguous_range<R> && std::ranges::s
 // port 支持哪些组合由它自己的 communicate / communicate_range 重载决定。
 // communicate 只接受 send_pack / receive_pack / transceive_pack 的返回值，communicate_range 只接受一个范围，都不接受额外参数；
 // 要改的配置（flags 等）是 pack 的参数，或是 port 自己的成员。
-// communicate / communicate_range 一律返回 sender：完成值走 set_value，错误走 set_error(std::error_code)，不抛异常。
+// communicate / communicate_range 一律返回 sender：完成值走 set_value，错误走 set_error，不抛异常。
+// 错误的类型由各总线自己定（错误来源是 errno 的总线就直接用 errno 的值，int）。
 // 同步的操作在 start 时就地完成；调用方要结果就 sync_wait。
 struct send_pack_t {
 	constexpr auto operator()(auto& port, auto&&... args) const

@@ -6,7 +6,6 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
-#include <system_error>
 #include <cstdint>
 #include <span>
 
@@ -28,7 +27,7 @@ struct command {
 struct protocol_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value() && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = protocol_receiver>
 concept protocol = requires(P& p, command c, std::uint8_t b, std::uint16_t w, ::i2c_smbus_data const& out, std::uint8_t& rb, std::uint16_t& rw,

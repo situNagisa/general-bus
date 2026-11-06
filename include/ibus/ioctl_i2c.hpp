@@ -5,7 +5,6 @@
 
 #include <cerrno>
 #include <cstddef>
-#include <system_error>
 #include <span>
 
 #include <unistd.h>
@@ -17,7 +16,7 @@ namespace ibus::ioctl_i2c {
 struct read_write_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = read_write_receiver>
 concept read_write = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in) {

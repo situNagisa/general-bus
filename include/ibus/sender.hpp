@@ -4,31 +4,29 @@
 #include <stdexec/execution.hpp>
 
 #include <cerrno>
-#include <system_error>
 #include <type_traits>
 #include <utility>
 
 // communicate / communicate_range 返回的 sender 都由这里用 exec::create 组合出来：
-// start 时同步调用 f（最多一次系统调用），完成值走 set_value，错误走 set_error(std::error_code)。
+// start 时同步调用 f（最多一次系统调用），完成值走 set_value。
+// syscall 给错误来源是 errno 的总线用：错误走 set_error(int)，值就是 errno。
 // f 的返回值类型是 void，所以在 f 里同步完成是安全的（exec::create 在调用 f 之后不再访问 op state）。
 namespace ibus::detail {
-
-inline std::error_code errno_code() noexcept { return {errno, std::generic_category()}; }
 
 // f() 返回系统调用的原始返回值 r：r < 0 时 set_error(errno)，否则 set_value(T(r))（T 为 void 时 set_value()）。
 template <class T>
 auto syscall(auto f) noexcept {
 	if constexpr (std::is_void_v<T>) {
-		return exec::create<stdexec::set_value_t(), stdexec::set_error_t(std::error_code)>(
+		return exec::create<stdexec::set_value_t(), stdexec::set_error_t(int)>(
 			[f = std::move(f)](auto& ctx) mutable noexcept {
-				if (f() < 0) stdexec::set_error(std::move(ctx.receiver), errno_code());
+				if (f() < 0) stdexec::set_error(std::move(ctx.receiver), errno);
 				else stdexec::set_value(std::move(ctx.receiver));
 			});
 	} else {
-		return exec::create<stdexec::set_value_t(T), stdexec::set_error_t(std::error_code)>(
+		return exec::create<stdexec::set_value_t(T), stdexec::set_error_t(int)>(
 			[f = std::move(f)](auto& ctx) mutable noexcept {
 				auto r = f();
-				if (r < 0) stdexec::set_error(std::move(ctx.receiver), errno_code());
+				if (r < 0) stdexec::set_error(std::move(ctx.receiver), errno);
 				else stdexec::set_value(std::move(ctx.receiver), static_cast<T>(r));
 			});
 	}

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <tuple>
 #include <exception>
 #include <span>
@@ -20,7 +21,7 @@
 
 using namespace ibus;
 
-// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+// sync_wait 取 sender 唯一的完成值（set_error(errno) 时 sync_wait 把 errno 的值作为 int 抛出）。
 static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
@@ -53,6 +54,8 @@ int main(int argc, char** argv) {
 		std::array<::spi_ioc_transfer, 2> seg{send_pack(ml, std::span<std::byte const>(cmd)), receive_pack(ml, std::span(id))};
 		std::printf("message range: %zu bytes\n", value(communicate_range(ml, std::span(seg))));
 		::close(fd);
+	} catch (int e) {  // sync_wait 抛出的 errno
+		std::printf("error: %s\n", std::strerror(e));
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());
 	}

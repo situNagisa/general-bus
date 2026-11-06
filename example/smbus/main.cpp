@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <span>
 #include <system_error>
@@ -36,6 +37,8 @@ int main(int argc, char** argv) {
 		stdexec::sync_wait(communicate(l, send_pack(l, smbus::command{0x30}), receive_pack(l, blk)));
 		std::printf("block 0x30: %u bytes\n", blk.block[0]);
 		::close(fd);
+	} catch (int e) {  // sync_wait 抛出的 errno
+		std::printf("error: %s\n", std::strerror(e));
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());
 	}

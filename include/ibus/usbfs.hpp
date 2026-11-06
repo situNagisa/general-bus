@@ -6,7 +6,6 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
-#include <system_error>
 #include <span>
 
 #include <endian.h>
@@ -22,7 +21,7 @@ namespace ibus::usbfs {
 struct control_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = control_receiver>
 concept control = requires(P& p, ::usb_ctrlrequest const& setup, unsigned timeout_ms, std::span<std::byte const> out, std::span<std::byte> in) {

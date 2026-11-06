@@ -7,7 +7,6 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
-#include <system_error>
 #include <cstdint>
 #include <span>
 
@@ -37,7 +36,7 @@ inline void store(std::uint32_t* p, std::uint32_t v) noexcept { std::atomic_ref(
 struct producer_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value() && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class Desc, class R = producer_receiver>
 concept producer = requires(P& p, Desc d) {

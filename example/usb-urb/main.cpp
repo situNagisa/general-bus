@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <span>
@@ -40,6 +41,8 @@ int main(int argc, char** argv) {
 		reaping.join();
 		::ioctl(fd, USBDEVFS_RELEASEINTERFACE, &ifc);
 		::close(fd);
+	} catch (int e) {  // sync_wait 抛出的 errno
+		std::printf("error: %s\n", std::strerror(e));
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());
 	}

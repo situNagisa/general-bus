@@ -5,6 +5,7 @@
 // 用法：./ioctl-i2c [/dev/i2c-N]
 
 #include <cstdio>
+#include <cstring>
 #include <tuple>
 #include <exception>
 #include <span>
@@ -15,7 +16,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-// sync_wait 取 sender 唯一的完成值（set_error(error_code) 时 sync_wait 抛 system_error）。
+// sync_wait 取 sender 唯一的完成值（set_error(errno) 时 sync_wait 把 errno 的值作为 int 抛出）。
 static auto value(auto&& s) { return std::get<0>(stdexec::sync_wait(std::forward<decltype(s)>(s)).value()); }
 
 int main(int argc, char** argv) {
@@ -33,6 +34,8 @@ int main(int argc, char** argv) {
 		auto n = value(communicate(l, receive_pack(l, std::span(data))));
 		std::printf("wrote %zu, read %zu bytes\n", w, n);
 		::close(fd);
+	} catch (int e) {  // sync_wait 抛出的 errno
+		std::printf("error: %s\n", std::strerror(e));
 	} catch (std::exception const& e) {
 		std::printf("error: %s\n", e.what());
 	}

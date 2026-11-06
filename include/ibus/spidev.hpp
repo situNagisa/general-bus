@@ -8,7 +8,6 @@
 #include <cerrno>
 #include <concepts>
 #include <cstddef>
-#include <system_error>
 #include <cstdint>
 #include <span>
 #include <type_traits>
@@ -29,7 +28,7 @@ concept static_transfers = requires { S::extent; } && (S::extent != std::dynamic
 struct read_write_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = read_write_receiver>
 concept read_write = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in) {
@@ -43,7 +42,7 @@ concept read_write = requires(P& p, std::span<std::byte const> out, std::span<st
 struct message_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = message_receiver>
 concept message = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in, std::uint32_t speed_hz, bool cs_change,

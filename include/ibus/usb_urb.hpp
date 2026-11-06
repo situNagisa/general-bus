@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <new>
 #include <span>
-#include <system_error>
 #include <type_traits>
 #include <utility>
 
@@ -42,9 +41,9 @@ struct reaper {
 
 	// 阻塞收割一个已完成的 URB 并完成对应的 sender；完成值为空，REAPURB 失败时 set_error(errno)。
 	auto run_one() const noexcept {
-		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(std::error_code)>([fd = fd](auto&& r) noexcept {
+		return ibus::detail::complete<stdexec::set_value_t(), stdexec::set_error_t(int)>([fd = fd](auto&& r) noexcept {
 			::usbdevfs_urb* u = nullptr;
-			if (::ioctl(fd, USBDEVFS_REAPURB, &u) < 0) return stdexec::set_error(std::move(r), ibus::detail::errno_code());
+			if (::ioctl(fd, USBDEVFS_REAPURB, &u) < 0) return stdexec::set_error(std::move(r), errno);
 			auto* h = static_cast<detail::urb_header*>(u->usercontext);  // usercontext 在提交前设为在途状态的 header
 			h->complete(h->self);
 			stdexec::set_value(std::move(r));
@@ -57,7 +56,7 @@ struct reaper {
 struct transfer_receiver {
 	using receiver_concept = stdexec::receiver_t;
 	void set_value(std::size_t) && noexcept {}
-	void set_error(std::error_code) && noexcept {}
+	void set_error(int) && noexcept {}
 };
 template <class P, class R = transfer_receiver>
 concept transfer = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in, unsigned flags) {
@@ -112,7 +111,7 @@ private:
 			u.buffer = buffer;
 			u.buffer_length = length;
 			u.usercontext = &header;
-			if (::ioctl(fd, USBDEVFS_SUBMITURB, &u) < 0) stdexec::set_error(std::move(c.receiver), ibus::detail::errno_code());
+			if (::ioctl(fd, USBDEVFS_SUBMITURB, &u) < 0) stdexec::set_error(std::move(c.receiver), errno);
 		}
 
 		template <class Ctx>
@@ -120,13 +119,13 @@ private:
 			auto* self = static_cast<_submit*>(p);
 			auto& c = *static_cast<Ctx*>(self->ctx);
 			auto& u = self->urb();
-			if (u.status < 0) return stdexec::set_error(std::move(c.receiver), std::error_code(-u.status, std::generic_category()));
+			if (u.status < 0) return stdexec::set_error(std::move(c.receiver), -u.status);
 			stdexec::set_value(std::move(c.receiver), static_cast<std::size_t>(u.actual_length));
 		}
 	};
 
 	auto _make(void* buf, std::size_t n, unsigned flags) const noexcept {
-		return exec::create<stdexec::set_value_t(std::size_t), stdexec::set_error_t(std::error_code)>(
+		return exec::create<stdexec::set_value_t(std::size_t), stdexec::set_error_t(int)>(
 			_submit{fd, type, endpoint, flags, buf, static_cast<int>(n), {}, nullptr, {}});
 	}
 
