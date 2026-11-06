@@ -103,8 +103,8 @@ int main() {
 		{
 			int sv3[2];
 			::socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sv3);
-			sock::sendmmsg_port ma{sv3[0]};
-			sock::recvmmsg_port mb{sv3[1]};
+			sock::sendmmsg_port ma{sv3[0], 0};
+			sock::recvmmsg_port mb{sv3[1], 0, nullptr};
 			char d0[] = "one", d1[] = "three", d2[] = "x";
 			std::array<::iovec, 3> tiov{{{d0, 3}, {d1, 5}, {d2, 1}}};
 			std::vector<::mmsghdr> tx;
@@ -165,8 +165,8 @@ int main() {
 			::connect(tx, reinterpret_cast<::sockaddr*>(&a), sizeof a);
 			int on = 1;
 			::setsockopt(rxs, IPPROTO_UDP, UDP_GRO, &on, sizeof on);
-			sock::sendmsg_port gs{tx};
-			sock::recvmsg_port gr{rxs};
+			sock::sendmsg_port gs{tx, 0, 0};
+			sock::recvmsg_port gr{rxs, {}, 0};
 			static std::array<std::byte, 3500> big{};
 			static std::array<std::byte, 65536> rbuf{};
 			alignas(::cmsghdr) std::array<std::byte, CMSG_SPACE(sizeof(int))> ctrl;

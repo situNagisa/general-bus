@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <system_error>
 #include <cstdint>
 #include <span>
 
@@ -30,6 +31,34 @@ namespace detail {
 inline std::uint32_t load(std::uint32_t* p) noexcept { return std::atomic_ref(*p).load(std::memory_order_acquire); }
 inline void store(std::uint32_t* p, std::uint32_t v) noexcept { std::atomic_ref(*p).store(v, std::memory_order_release); }
 }  // namespace detail
+
+// concept：生产者一侧（fill 环、TX 环）。send_pack(Desc) 写进下一个槽位，send_pack(publish) 发布，完成值都为空。
+// producer 的参考 receiver：正好接得住 producer 里各组合发出的完成；用户的 receiver 照这个写，作为 producer 的 R 参数检查。
+struct producer_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value() && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class Desc, class R = producer_receiver>
+concept producer = requires(P& p, Desc d) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, d))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, publish))), R>;
+};
+
+// concept：消费者一侧（RX 环、completion 环）。receive_pack() 取下一个描述，完成值是指向它的指针（没有是 nullptr）；
+// send_pack(publish) 归还，完成值为空。
+// consumer 的参考 receiver：正好接得住 consumer 里各组合发出的完成；用户的 receiver 照这个写，作为 consumer 的 R 参数检查。
+template <class Desc>
+struct consumer_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value() && noexcept {}
+	void set_value(Desc const*) && noexcept {}
+};
+template <class P, class Desc, class R = consumer_receiver<Desc>>
+concept consumer = requires(P& p) {
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, publish))), R>;
+};
 
 // 一个已 mmap 的环（XDP_MMAP_OFFSETS 给出 producer / consumer / desc 偏移），作为生产者一侧的 port。
 // pending 是写进去但还没发布的生产者位置（只有用户态写 producer）。
@@ -123,5 +152,8 @@ struct tx_port : producer_port<::xdp_desc> {
 using fill_port = producer_port<std::uint64_t>;
 using rx_port = consumer_port<::xdp_desc>;
 using completion_port = consumer_port<std::uint64_t>;
+
+static_assert(producer<fill_port, std::uint64_t> && producer<tx_port, ::xdp_desc>);
+static_assert(consumer<rx_port, ::xdp_desc> && consumer<completion_port, std::uint64_t>);
 
 }  // namespace ibus::af_xdp

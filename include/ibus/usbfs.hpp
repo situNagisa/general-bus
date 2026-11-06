@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <system_error>
 #include <span>
 
 #include <endian.h>
@@ -14,6 +15,21 @@
 #include <sys/ioctl.h>
 
 namespace ibus::usbfs {
+
+// concept：控制传输。send_pack(setup, timeout_ms) 是 setup 阶段，send_pack(data) / receive_pack(data) 是数据阶段；
+// communicate(setup) / (setup, OUT) / (setup, IN) 各一次控制传输，完成值是数据阶段的字节数。
+// control 的参考 receiver：正好接得住 control 里各组合发出的完成；用户的 receiver 照这个写，作为 control 的第二个参数检查。
+struct control_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = control_receiver>
+concept control = requires(P& p, ::usb_ctrlrequest const& setup, unsigned timeout_ms, std::span<std::byte const> out, std::span<std::byte> in) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, setup, timeout_ms))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, setup, timeout_ms), send_pack(p, out))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, setup, timeout_ms), receive_pack(p, in))), R>;
+};
 
 // port：一个 USB 设备的默认控制端点（已打开的 /dev/bus/usb/BBB/DDD，由用户打开、关闭）。
 // USBDEVFS_CONTROL 是同步的：communicate 返回 sender，start 时一次 ioctl，完成值是数据阶段的字节数，失败 set_error(errno)。
@@ -69,5 +85,7 @@ public:
 		return _control(s, d.data.data());
 	}
 };
+
+static_assert(control<port>);
 
 }  // namespace ibus::usbfs

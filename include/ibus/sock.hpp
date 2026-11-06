@@ -10,6 +10,7 @@
 #include <ranges>
 #include <span>
 #include <system_error>
+#include <type_traits>
 
 #include <fcntl.h>
 #include <linux/errqueue.h>
@@ -22,7 +23,9 @@
 // 所有 port 都不持有 fd：socket 由用户创建、连接、配置、关闭，port 只记下 fd。
 // 都是同步系统调用（阻不阻塞看 fd 自己）：communicate / communicate_range 返回 sender，start 时做一次系统调用，
 // 完成值走 set_value，失败走 set_error(std::error_code)（errno）。
-// 每次调用的 flags 等是 send_pack / receive_pack（或 communicate_range）的参数。
+// 每次调用的 flags 等是 send_pack / receive_pack 的参数；communicate / communicate_range 不接受额外参数，
+// 动态 n 段要用的 flags 等是 port 的成员，由用户设置。
+// 下面先是 concept（各种 port 的结构），再是满足它们的便利 port。
 namespace ibus::sock {
 
 // 文件区间：sendfile 的数据来源，不经过用户内存。
@@ -36,6 +39,146 @@ struct file_region {
 struct pipe_region {
 	int fd;
 	std::size_t count;
+};
+
+// recvmsg 的完成值。
+struct recvmsg_result {
+	std::size_t size;          // 收到的字节数
+	int flags;                 // msg_flags：MSG_TRUNC、MSG_CTRUNC 等
+	std::size_t control_size;  // 控制缓冲里实际写了多少
+};
+
+// ---- concept：只规定 send_pack / receive_pack 要接受的参数，以及 communicate / communicate_range 支持的组合；
+// 返回的 sender 要能和 R（默认是上面的 receiver）连接，完成值的具体类型不做规定。
+// pack 的类型由 port 自己定。下面的便利 port 各满足其中一个或几个；用户可以按同样的结构写自己的 port（比如把 flags 写死）。
+
+// send / recv：send_pack(data, flags)、receive_pack(data, flags)，完成值是字节数。
+// stream 的参考 receiver：正好接得住 stream 里各组合发出的完成；用户的 receiver 照这个写，作为 stream 的第二个参数检查。
+struct stream_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = stream_receiver>
+concept stream = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in, int flags) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, out, flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, in, flags))), R>;
+};
+
+// sendfile：send_pack(file_region)，完成值是字节数。
+// file_send 的参考 receiver：正好接得住 file_send 里各组合发出的完成；用户的 receiver 照这个写，作为 file_send 的第二个参数检查。
+struct file_send_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = file_send_receiver>
+concept file_send = requires(P& p, file_region r) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, r))), R>;
+};
+
+// splice：send_pack(pipe_region, flags) 是 pipe → socket，receive_pack(pipe_region, flags) 是 socket → pipe，完成值是字节数。
+// splicing 的参考 receiver：正好接得住 splicing 里各组合发出的完成；用户的 receiver 照这个写，作为 splicing 的第二个参数检查。
+struct splicing_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = splicing_receiver>
+concept splicing = requires(P& p, pipe_region r, unsigned flags) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, r, flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, r, flags))), R>;
+};
+
+// 错误队列：receive_pack(控制缓冲)，完成值是指向控制缓冲里 sock_extended_err 的指针。
+// error_queue 的参考 receiver：正好接得住 error_queue 里各组合发出的完成；用户的 receiver 照这个写，作为 error_queue 的第二个参数检查。
+struct error_queue_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(::sock_extended_err const*) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = error_queue_receiver>
+concept error_queue = requires(P& p, std::span<std::byte> control) {
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, control))), R>;
+};
+
+// writev：send_pack(data) 返回 iovec，communicate_range(iovec 的连续区间)，完成值是总字节数。
+// gather_write 的参考 receiver：正好接得住 gather_write 里各组合发出的完成；用户的 receiver 照这个写，作为 gather_write 的第二个参数检查。
+struct gather_write_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = gather_write_receiver>
+concept gather_write = requires(P& p, std::span<std::byte const> out, std::span<::iovec> iovs) {
+	{ send_pack(p, out) } -> std::same_as<::iovec>;
+	requires stdexec::sender_to<decltype(communicate_range(p, iovs)), R>;
+};
+
+// readv：receive_pack(data) 返回 iovec，communicate_range(iovec 的连续区间)，完成值是总字节数。
+// scatter_read 的参考 receiver：正好接得住 scatter_read 里各组合发出的完成；用户的 receiver 照这个写，作为 scatter_read 的第二个参数检查。
+struct scatter_read_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = scatter_read_receiver>
+concept scatter_read = requires(P& p, std::span<std::byte> in, std::span<::iovec> iovs) {
+	{ receive_pack(p, in) } -> std::same_as<::iovec>;
+	requires stdexec::sender_to<decltype(communicate_range(p, iovs)), R>;
+};
+
+// sendmsg：send_pack(data, flags, gso_size) 1 段；communicate_range(iovecs) 动态 n 段（flags、gso_size 由 port 自己定）。完成值是字节数。
+// message_send 的参考 receiver：正好接得住 message_send 里各组合发出的完成；用户的 receiver 照这个写，作为 message_send 的第二个参数检查。
+struct message_send_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = message_send_receiver>
+concept message_send = requires(P& p, std::span<std::byte const> out, std::span<::iovec> iovs, int flags, std::uint16_t gso_size) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, out, flags, gso_size))), R>;
+	requires stdexec::sender_to<decltype(communicate_range(p, iovs)), R>;
+};
+
+// recvmsg：receive_pack(data, control, flags) 1 段；communicate_range(iovecs) 动态 n 段（控制缓冲、flags 由 port 自己定）。
+// 完成值是 recvmsg_result。
+// message_receive 的参考 receiver：正好接得住 message_receive 里各组合发出的完成；用户的 receiver 照这个写，作为 message_receive 的第二个参数检查。
+struct message_receive_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(recvmsg_result) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = message_receive_receiver>
+concept message_receive = requires(P& p, std::span<std::byte> in, std::span<std::byte> control, std::span<::iovec> iovs, int flags) {
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, in, control, flags))), R>;
+	requires stdexec::sender_to<decltype(communicate_range(p, iovs)), R>;
+};
+
+// sendmmsg：send_pack(iovecs) 返回 mmsghdr，communicate_range(mmsghdrs)（flags 由 port 自己定），完成值是成功的数据报个数。
+// multi_send 的参考 receiver：正好接得住 multi_send 里各组合发出的完成；用户的 receiver 照这个写，作为 multi_send 的第二个参数检查。
+struct multi_send_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = multi_send_receiver>
+concept multi_send = requires(P& p, std::span<::iovec> iov, std::span<::mmsghdr> msgs) {
+	{ send_pack(p, iov) } -> std::same_as<::mmsghdr>;
+	requires stdexec::sender_to<decltype(communicate_range(p, msgs)), R>;
+};
+
+// recvmmsg：receive_pack(iovecs) 返回 mmsghdr，communicate_range(mmsghdrs)（flags、timeout 由 port 自己定），完成值是收到的数据报个数。
+// multi_receive 的参考 receiver：正好接得住 multi_receive 里各组合发出的完成；用户的 receiver 照这个写，作为 multi_receive 的第二个参数检查。
+struct multi_receive_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = multi_receive_receiver>
+concept multi_receive = requires(P& p, std::span<::iovec> iov, std::span<::mmsghdr> msgs) {
+	{ receive_pack(p, iov) } -> std::same_as<::mmsghdr>;
+	requires stdexec::sender_to<decltype(communicate_range(p, msgs)), R>;
 };
 
 namespace detail {
@@ -139,10 +282,26 @@ struct writev_port {
 
 	::iovec send_pack(std::span<std::byte const> d) const noexcept { return detail::iov(d); }
 
-	auto communicate_range(auto&& iovs) const noexcept {
-		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::ranges::data(iovs), n = static_cast<int>(std::ranges::size(iovs))] noexcept {
-			return ::writev(fd, v, n);
+private:
+	auto _writev(auto v) const noexcept(std::is_nothrow_move_constructible_v<decltype(v)>) {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::move(v)] mutable noexcept {
+			return ::writev(fd, std::ranges::data(v), static_cast<int>(std::ranges::size(v)));
 		});
+	}
+
+public:
+	// 左值 / 视图：只记地址，元素由用户保证活到完成。
+	auto communicate_range(contiguous_range_of<::iovec const> auto&& r) const noexcept
+		requires std::ranges::borrowed_range<decltype(r)>
+	{
+		return _writev(std::span<::iovec const>(r));
+	}
+
+	// 持有元素的右值（临时 array / vector）：移进 sender。
+	auto communicate_range(contiguous_range_of<::iovec const> auto&& r) const
+		requires(!std::ranges::borrowed_range<decltype(r)>)
+	{
+		return _writev(std::move(r));
 	}
 };
 
@@ -151,10 +310,26 @@ struct readv_port {
 
 	::iovec receive_pack(std::span<std::byte> d) const noexcept { return detail::iov(d); }
 
-	auto communicate_range(auto&& iovs) const noexcept {
-		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::ranges::data(iovs), n = static_cast<int>(std::ranges::size(iovs))] noexcept {
-			return ::readv(fd, v, n);
+private:
+	auto _readv(auto v) const noexcept(std::is_nothrow_move_constructible_v<decltype(v)>) {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::move(v)] mutable noexcept {
+			return ::readv(fd, std::ranges::data(v), static_cast<int>(std::ranges::size(v)));
 		});
+	}
+
+public:
+	// 左值 / 视图：只记地址，元素由用户保证活到完成。
+	auto communicate_range(contiguous_range_of<::iovec const> auto&& r) const noexcept
+		requires std::ranges::borrowed_range<decltype(r)>
+	{
+		return _readv(std::span<::iovec const>(r));
+	}
+
+	// 持有元素的右值（临时 array / vector）：移进 sender。
+	auto communicate_range(contiguous_range_of<::iovec const> auto&& r) const
+		requires(!std::ranges::borrowed_range<decltype(r)>)
+	{
+		return _readv(std::move(r));
 	}
 };
 
@@ -181,8 +356,11 @@ inline ::ssize_t sendmsg(int fd, ::iovec* v, std::size_t n, int flags, std::uint
 }  // namespace detail
 
 // sendmsg_port：sendmsg，1 段或动态 n 段 iovec 合成 1 个单元，可带 UDP GSO。
+// 1 段的 flags、gso_size 是 send_pack 的参数；动态 n 段用 port 的成员 flags、gso_size（由用户设置）。
 struct sendmsg_port {
 	int fd;
+	int flags;               // 动态 n 段用：MSG_NOSIGNAL 等
+	std::uint16_t gso_size;  // 动态 n 段用：非 0 时附带 UDP_SEGMENT
 
 	struct send_packet {
 		std::span<std::byte const> data;
@@ -200,24 +378,39 @@ struct sendmsg_port {
 		});
 	}
 
-	// 动态 n 段：一段连续的 iovec。返回发出的字节数。
-	auto communicate_range(auto&& iovs, int flags = 0, std::uint16_t gso_size = 0) const noexcept {
-		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::ranges::data(iovs), n = std::ranges::size(iovs), flags, gso_size] noexcept {
-			return detail::sendmsg(fd, v, n, flags, gso_size);
+private:
+	auto _sendmsg(auto v) const noexcept(std::is_nothrow_move_constructible_v<decltype(v)>) {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::move(v), flags = flags, gso_size = gso_size] mutable noexcept {
+			return detail::sendmsg(fd, std::ranges::data(v), std::ranges::size(v), flags, gso_size);
 		});
+	}
+
+public:
+	// 动态 n 段：一段连续的 iovec。完成值是发出的字节数。
+	// 左值 / 视图：只记地址，元素由用户保证活到完成。
+	auto communicate_range(contiguous_range_of<::iovec> auto&& r) const noexcept
+		requires std::ranges::borrowed_range<decltype(r)>
+	{
+		return _sendmsg(std::span<::iovec>(r));
+	}
+
+	// 持有元素的右值（临时 array / vector）：移进 sender。
+	auto communicate_range(contiguous_range_of<::iovec> auto&& r) const
+		requires(!std::ranges::borrowed_range<decltype(r)>)
+	{
+		return _sendmsg(std::move(r));
 	}
 };
 
 // recvmsg_port：recvmsg，1 段或动态 n 段 iovec，可带控制缓冲（cmsg：时间戳、IP_PKTINFO、UDP_GRO 的 gso_size 等）。
 // cmsg 的解析由用户做（CMSG_FIRSTHDR / CMSG_NXTHDR 遍历用户给的控制缓冲）。
+// 1 段的控制缓冲、flags 是 receive_pack 的参数；动态 n 段用 port 的成员 control、flags（由用户设置）。
 struct recvmsg_port {
 	int fd;
+	std::span<std::byte> control;  // 动态 n 段用：控制缓冲（可为空）
+	int flags;                     // 动态 n 段用：MSG_DONTWAIT、MSG_TRUNC 等
 
-	struct result {
-		std::size_t size;           // 收到的字节数
-		int flags;                  // msg_flags：MSG_TRUNC、MSG_CTRUNC 等
-		std::size_t control_size;   // 控制缓冲里实际写了多少
-	};
+	using result = recvmsg_result;
 
 	struct receive_packet {
 		std::span<std::byte> data;
@@ -249,10 +442,27 @@ public:
 		});
 	}
 
-	auto communicate_range(auto&& iovs, std::span<std::byte> control = {}, int flags = 0) const noexcept {
-		return _make([fd = fd, v = std::ranges::data(iovs), n = std::ranges::size(iovs), control, flags](auto&& r) noexcept {
-			_receive(std::move(r), fd, v, n, control, flags);
+private:
+	auto _recvmsg(auto v) const noexcept(std::is_nothrow_move_constructible_v<decltype(v)>) {
+		return _make([fd = fd, v = std::move(v), control = control, flags = flags](auto&& r) mutable noexcept {
+			_receive(std::move(r), fd, std::ranges::data(v), std::ranges::size(v), control, flags);
 		});
+	}
+
+public:
+	// 动态 n 段：一段连续的 iovec。
+	// 左值 / 视图：只记地址，元素由用户保证活到完成。
+	auto communicate_range(contiguous_range_of<::iovec> auto&& r) const noexcept
+		requires std::ranges::borrowed_range<decltype(r)>
+	{
+		return _recvmsg(std::span<::iovec>(r));
+	}
+
+	// 持有元素的右值（临时 array / vector）：移进 sender。
+	auto communicate_range(contiguous_range_of<::iovec> auto&& r) const
+		requires(!std::ranges::borrowed_range<decltype(r)>)
+	{
+		return _recvmsg(std::move(r));
 	}
 };
 
@@ -262,6 +472,7 @@ public:
 // 接收时 msg_hdr.msg_flags 也由内核写回（MSG_TRUNC 等）。
 struct sendmmsg_port {
 	int fd;
+	int flags;  // sendmmsg 的 flags（由用户设置）
 
 	::mmsghdr send_pack(std::span<::iovec> iov) const noexcept {
 		::mmsghdr h{};
@@ -270,15 +481,33 @@ struct sendmmsg_port {
 		return h;
 	}
 
-	auto communicate_range(auto&& msgs, int flags = 0) const noexcept {
-		return ibus::detail::syscall<std::size_t>([fd = fd, m = std::ranges::data(msgs), n = static_cast<unsigned>(std::ranges::size(msgs)), flags] noexcept {
-			return ::sendmmsg(fd, m, n, flags);
+private:
+	auto _sendmmsg(auto v) const noexcept(std::is_nothrow_move_constructible_v<decltype(v)>) {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::move(v), flags = flags] mutable noexcept {
+			return ::sendmmsg(fd, std::ranges::data(v), static_cast<unsigned>(std::ranges::size(v)), flags);
 		});
+	}
+
+public:
+	// 左值 / 视图：只记地址，元素由用户保证活到完成。
+	auto communicate_range(contiguous_range_of<::mmsghdr> auto&& r) const noexcept
+		requires std::ranges::borrowed_range<decltype(r)>
+	{
+		return _sendmmsg(std::span<::mmsghdr>(r));
+	}
+
+	// 持有元素的右值（临时 array / vector）：移进 sender。
+	auto communicate_range(contiguous_range_of<::mmsghdr> auto&& r) const
+		requires(!std::ranges::borrowed_range<decltype(r)>)
+	{
+		return _sendmmsg(std::move(r));
 	}
 };
 
 struct recvmmsg_port {
 	int fd;
+	int flags;           // 例如 MSG_WAITFORONE（收到第一个后不再阻塞）（由用户设置）
+	::timespec* timeout;  // recvmmsg 的超时参数，nullptr 表示不限（由用户设置）
 
 	::mmsghdr receive_pack(std::span<::iovec> iov) const noexcept {
 		::mmsghdr h{};
@@ -287,13 +516,33 @@ struct recvmmsg_port {
 		return h;
 	}
 
-	// flags：例如 MSG_WAITFORONE（收到第一个后不再阻塞）；timeout：recvmmsg 的超时参数。
-	auto communicate_range(auto&& msgs, int flags = 0, ::timespec* timeout = nullptr) const noexcept {
-		return ibus::detail::syscall<std::size_t>(
-			[fd = fd, m = std::ranges::data(msgs), n = static_cast<unsigned>(std::ranges::size(msgs)), flags, timeout] noexcept {
-				return ::recvmmsg(fd, m, n, flags, timeout);
-			});
+private:
+	auto _recvmmsg(auto v) const noexcept(std::is_nothrow_move_constructible_v<decltype(v)>) {
+		return ibus::detail::syscall<std::size_t>([fd = fd, v = std::move(v), flags = flags, timeout = timeout] mutable noexcept {
+			return ::recvmmsg(fd, std::ranges::data(v), static_cast<unsigned>(std::ranges::size(v)), flags, timeout);
+		});
+	}
+
+public:
+	// 左值 / 视图：只记地址，元素由用户保证活到完成。
+	auto communicate_range(contiguous_range_of<::mmsghdr> auto&& r) const noexcept
+		requires std::ranges::borrowed_range<decltype(r)>
+	{
+		return _recvmmsg(std::span<::mmsghdr>(r));
+	}
+
+	// 持有元素的右值（临时 array / vector）：移进 sender。
+	auto communicate_range(contiguous_range_of<::mmsghdr> auto&& r) const
+		requires(!std::ranges::borrowed_range<decltype(r)>)
+	{
+		return _recvmmsg(std::move(r));
 	}
 };
+
+static_assert(stream<port> && file_send<port> && splicing<port>);
+static_assert(error_queue<errqueue_port>);
+static_assert(gather_write<writev_port> && scatter_read<readv_port>);
+static_assert(message_send<sendmsg_port> && message_receive<recvmsg_port>);
+static_assert(multi_send<sendmmsg_port> && multi_receive<recvmmsg_port>);
 
 }  // namespace ibus::sock

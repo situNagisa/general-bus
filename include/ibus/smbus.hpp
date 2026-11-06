@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <system_error>
 #include <cstdint>
 #include <span>
 
@@ -18,6 +19,28 @@ namespace ibus::smbus {
 // 命令字节（通常是寄存器号），和 1 字节数据区分开。
 struct command {
 	std::uint8_t value;
+};
+
+// concept：SMBus 的固定格式事务，每种格式是 communicate 的一种组合，完成值为空（读到的写进 receive_pack 给的位置）。
+//   send_pack(command) / send_pack(uint8_t) / send_pack(uint16_t) / send_pack(i2c_smbus_data const&)
+//   receive_pack(uint8_t&) / receive_pack(uint16_t&) / receive_pack(i2c_smbus_data&)
+// protocol 的参考 receiver：正好接得住 protocol 里各组合发出的完成；用户的 receiver 照这个写，作为 protocol 的第二个参数检查。
+struct protocol_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value() && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = protocol_receiver>
+concept protocol = requires(P& p, command c, std::uint8_t b, std::uint16_t w, ::i2c_smbus_data const& out, std::uint8_t& rb, std::uint16_t& rw,
+	::i2c_smbus_data& in) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, b))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, rb))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, c), send_pack(p, b))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, c), send_pack(p, w))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, c), receive_pack(p, rb))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, c), receive_pack(p, rw))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, c), send_pack(p, out))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, c), receive_pack(p, in))), R>;
 };
 
 // port：已打开的 /dev/i2c-N，且已 ioctl(I2C_SLAVE) 绑定从机地址（都由用户做）。走 ioctl(I2C_SMBUS)。
@@ -135,5 +158,7 @@ private:
 	}
 
 };
+
+static_assert(protocol<port>);
 
 }  // namespace ibus::smbus

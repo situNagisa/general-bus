@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <concepts>
 #include <cstddef>
+#include <system_error>
 #include <cstdint>
 #include <span>
 #include <type_traits>
@@ -22,6 +23,38 @@ namespace ibus::spidev {
 template <class S>
 concept static_transfers = requires { S::extent; } && (S::extent != std::dynamic_extent)
 	&& std::same_as<std::remove_const_t<typename S::element_type>, ::spi_ioc_transfer>;
+
+// concept：send_pack(data) 一次 write、receive_pack(data) 一次 read（各是一次独立片选），完成值是字节数。
+// read_write 的参考 receiver：正好接得住 read_write 里各组合发出的完成；用户的 receiver 照这个写，作为 read_write 的第二个参数检查。
+struct read_write_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = read_write_receiver>
+concept read_write = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, out))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, in))), R>;
+};
+
+// concept：SPI_IOC_MESSAGE。send_pack / receive_pack / transceive_pack(数据, speed_hz, cs_change, delay_usecs, bits_per_word, nbits, word_delay_usecs)
+// 返回 spi_ioc_transfer；communicate_range(span<spi_ioc_transfer, N>) 把 N 段放进同一次片选，完成值是总字节数。
+// message 的参考 receiver：正好接得住 message 里各组合发出的完成；用户的 receiver 照这个写，作为 message 的第二个参数检查。
+struct message_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = message_receiver>
+concept message = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in, std::uint32_t speed_hz, bool cs_change,
+	std::uint16_t delay_usecs, std::uint8_t bits_per_word, std::uint8_t nbits, std::uint8_t word_delay_usecs,
+	std::span<::spi_ioc_transfer, 1> one, std::span<::spi_ioc_transfer, 2> two) {
+	{ send_pack(p, out, speed_hz, cs_change, delay_usecs, bits_per_word, nbits, word_delay_usecs) } -> std::same_as<::spi_ioc_transfer>;
+	{ receive_pack(p, in, speed_hz, cs_change, delay_usecs, bits_per_word, nbits, word_delay_usecs) } -> std::same_as<::spi_ioc_transfer>;
+	{ transceive_pack(p, out, in, speed_hz, cs_change, delay_usecs, bits_per_word, nbits, word_delay_usecs) } -> std::same_as<::spi_ioc_transfer>;
+	requires stdexec::sender_to<decltype(communicate_range(p, one)), R>;
+	requires stdexec::sender_to<decltype(communicate_range(p, two)), R>;
+};
 
 // port：一个 SPI 从机（已打开的 /dev/spidevB.C，由用户打开、配置模式和默认速率、关闭）。
 // 每次 communicate 是一次独立的片选（read / write）。返回 sender：start 时一次系统调用，完成值是字节数，失败 set_error(errno)。
@@ -114,5 +147,7 @@ private:
 		return x;
 	}
 };
+
+static_assert(read_write<port> && message<message_port>);
 
 }  // namespace ibus::spidev

@@ -52,6 +52,19 @@ struct reaper {
 	}
 };
 
+// concept：send_pack / receive_pack(data, URB flags)，communicate 是一个 URB，完成值是 actual_length。
+// transfer 的参考 receiver：正好接得住 transfer 里各组合发出的完成；用户的 receiver 照这个写，作为 transfer 的第二个参数检查。
+struct transfer_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = transfer_receiver>
+concept transfer = requires(P& p, std::span<std::byte const> out, std::span<std::byte> in, unsigned flags) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, out, flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, in, flags))), R>;
+};
+
 // port：一个端点。type：USBDEVFS_URB_TYPE_BULK / USBDEVFS_URB_TYPE_INTERRUPT；endpoint：端点地址（IN 端点带 0x80）。
 struct port {
 	int fd;
@@ -122,5 +135,7 @@ public:
 	auto communicate(send_packet p) const noexcept { return _make(const_cast<std::byte*>(p.data.data()), p.data.size(), p.flags); }
 	auto communicate(receive_packet p) const noexcept { return _make(p.data.data(), p.data.size(), p.flags); }
 };
+
+static_assert(transfer<port>);
 
 }  // namespace ibus::usb_urb

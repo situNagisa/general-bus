@@ -14,7 +14,7 @@
 
 // 先编排、再一次提交的一类：RDMA verbs（libibverbs）。
 // port 不持有资源：设备、PD、MR、CQ、QP 及其状态迁移都由用户建、管、销毁，port 只记下句柄。
-// ibv_post_send / ibv_post_recv / ibv_poll_cq 都是同步调用（只入队 / 只取出，不等待），直接返回结果。
+// ibv_post_send / ibv_post_recv / ibv_poll_cq 都是同步调用（只入队 / 只取出，不等待）：communicate 返回 sender，start 时执行。
 namespace ibus::rdma {
 
 // 一段已注册内存：地址 + 长度 + MR 的 lkey。
@@ -51,6 +51,47 @@ struct send_wr {
 struct recv_wr {
 	::ibv_recv_wr wr;
 	::ibv_sge sge;
+};
+
+// concept：发送队列。send_pack(wr, 本地内存, [remote,] wr_id, send_flags) 编排 SEND / WRITE / READ，完成值为空；
+// send_pack(rdma::submit) 一次提交，完成值为空。
+// send_queue 的参考 receiver：正好接得住 send_queue 里各组合发出的完成；用户的 receiver 照这个写，作为 send_queue 的 R 参数检查。
+struct send_queue_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value() && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = send_queue_receiver>
+concept send_queue = requires(P& p, send_wr& w, const_region out, region in, remote r, std::uint64_t wr_id, unsigned send_flags) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, w, out, wr_id, send_flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, w, out, r, wr_id, send_flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, w, in, r, wr_id, send_flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, submit))), R>;
+};
+
+// concept：接收队列。send_pack(wr, 本地内存, wr_id) 挂一个接收缓冲，send_pack(rdma::submit) 一次提交，完成值都为空。
+// receive_queue 的参考 receiver：正好接得住 receive_queue 里各组合发出的完成；用户的 receiver 照这个写，作为 receive_queue 的 R 参数检查。
+struct receive_queue_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value() && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = receive_queue_receiver>
+concept receive_queue = requires(P& p, recv_wr& w, region in, std::uint64_t wr_id) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, w, in, wr_id))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, submit))), R>;
+};
+
+// concept：CQ。receive_pack(ibv_wc 数组) 一次最多取满，完成值是取到的个数。
+// completion_queue 的参考 receiver：正好接得住 completion_queue 里各组合发出的完成；用户的 receiver 照这个写，作为 completion_queue 的 R 参数检查。
+struct completion_queue_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = completion_queue_receiver>
+concept completion_queue = requires(P& p, std::span<::ibv_wc> out) {
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p, out))), R>;
 };
 
 // send_port：一个 QP 的发送队列。当作协议：
@@ -185,5 +226,7 @@ struct cq_port {
 		});
 	}
 };
+
+static_assert(send_queue<send_port> && receive_queue<recv_port> && completion_queue<cq_port>);
 
 }  // namespace ibus::rdma

@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
+#include <system_error>
 #include <cstdint>
 #include <span>
 
@@ -47,6 +48,36 @@ inline int enter(int ring_fd, unsigned to_submit, unsigned min_complete, unsigne
 }
 
 }  // namespace detail
+
+// concept：SQ。send_pack(uring::send / uring::receive, fd, data, user_data, sqe_flags, msg_flags) 编排一项，完成值为空；
+// send_pack(uring::submit, wait_nr) 提交，完成值是内核接受的项数。
+// submission_queue 的参考 receiver：正好接得住 submission_queue 里各组合发出的完成；用户的 receiver 照这个写，作为 submission_queue 的第二个参数检查。
+struct submission_queue_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value() && noexcept {}
+	void set_value(std::size_t) && noexcept {}
+	void set_error(std::error_code) && noexcept {}
+};
+template <class P, class R = submission_queue_receiver>
+concept submission_queue = requires(P& p, int fd, std::span<std::byte const> out, std::span<std::byte> in, std::uint64_t user_data,
+	std::uint8_t sqe_flags, std::uint32_t msg_flags, std::uint32_t wait_nr) {
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, send, fd, out, user_data, sqe_flags, msg_flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, receive, fd, in, user_data, sqe_flags, msg_flags))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, submit, wait_nr))), R>;
+};
+
+// concept：CQ。receive_pack() 取下一个 CQE，完成值是指向它的指针（没有是 nullptr）；send_pack(uring::release) 归还，完成值为空。
+// completion_queue 的参考 receiver：正好接得住 completion_queue 里各组合发出的完成；用户的 receiver 照这个写，作为 completion_queue 的第二个参数检查。
+struct completion_queue_receiver {
+	using receiver_concept = stdexec::receiver_t;
+	void set_value(::io_uring_cqe const*) && noexcept {}
+	void set_value() && noexcept {}
+};
+template <class P, class R = completion_queue_receiver>
+concept completion_queue = requires(P& p) {
+	requires stdexec::sender_to<decltype(communicate(p, receive_pack(p))), R>;
+	requires stdexec::sender_to<decltype(communicate(p, send_pack(p, release))), R>;
+};
 
 // sq_port：一个 io_uring 的 SQ。
 // SQE 槽位就按 tail 顺序取（槽位 = tail & mask），SQE 原地填写、下标原地写进索引环，提交时只发布 tail。
@@ -189,5 +220,7 @@ struct cq_port {
 		return ibus::detail::nothrow<void>([self = this] noexcept { detail::store_release(self->head, self->pending); });
 	}
 };
+
+static_assert(submission_queue<sq_port> && completion_queue<cq_port>);
 
 }  // namespace ibus::uring
